@@ -1,0 +1,16 @@
+{
+  "name": "@leion-roots/core",
+  "version": "0.1.0",
+  "private": true,
+  "main": "out/index.js",
+  "types": "out/index.d.ts",
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json"
+  },
+  "dependencies": {
+    "glob": "^13.0.0",
+    "js-yaml": "^4.1.0",
+    "chokidar": "^4.0.3",
+    "zod": "^3.23.8"
+  }
+}

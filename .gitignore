@@ -1,0 +1,24 @@
+node_modules/
+package-lock.json.bak
+
+# Build outputs
+out/
+packages/*/out/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local runtime data
+.intent-router/
+pipeline/*.intent.json

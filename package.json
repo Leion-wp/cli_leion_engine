@@ -1,0 +1,19 @@
+{
+  "name": "cli-leion-engine",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/core",
+    "packages/cli"
+  ],
+  "scripts": {
+    "build:core": "npm --prefix packages/core run build",
+    "build:cli": "npm --prefix packages/cli run build",
+    "build:all": "npm run build:core && npm run build:cli",
+    "cli": "node ./packages/cli/out/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "@types/node": "^22.15.3"
+  }
+}

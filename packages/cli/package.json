@@ -1,0 +1,12 @@
+{
+  "name": "@leion-roots/cli",
+  "version": "0.1.0",
+  "private": true,
+  "main": "out/index.js",
+  "bin": {
+    "leion-roots": "out/index.js"
+  },
+  "scripts": {
+    "build": "npm --prefix ../core run build && tsc -p ./tsconfig.json"
+  }
+}
