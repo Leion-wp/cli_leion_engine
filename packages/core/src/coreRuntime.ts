@@ -2,12 +2,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
     CoreHostPorts,
+    Disposable,
     Uri,
     commands,
     resetHostPorts,
     setConfigEntries,
     setHostPorts
 } from './ports/vscodeShim';
+import { pipelineEventBus } from './eventBus';
+import { loadWorkspaceConfig } from './services/config';
 
 export type CoreRuntimeOptions = {
     workspaceRoot?: string;
@@ -21,54 +24,6 @@ export type RunPipelineOptions = {
     startStepId?: string;
     context?: any;
 };
-
-function flattenConfig(prefix: string, input: any, output: Record<string, any>): void {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) {
-        output[prefix] = input;
-        return;
-    }
-    for (const [key, value] of Object.entries(input)) {
-        const nextPrefix = prefix ? `${prefix}.${key}` : key;
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-            flattenConfig(nextPrefix, value, output);
-        } else {
-            output[nextPrefix] = value;
-        }
-    }
-}
-
-function loadWorkspaceConfig(workspaceRoot: string): Record<string, any> {
-    const configPath = path.join(workspaceRoot, '.intent-router', 'config.json');
-    if (!fs.existsSync(configPath)) {
-        return {};
-    }
-    try {
-        const raw = fs.readFileSync(configPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        const entries: Record<string, any> = {};
-        if (parsed && typeof parsed === 'object' && parsed.intentRouter && typeof parsed.intentRouter === 'object') {
-            flattenConfig('intentRouter', parsed.intentRouter, entries);
-            if ((parsed as any).leionRoots && typeof (parsed as any).leionRoots === 'object') {
-                flattenConfig('leionRoots', (parsed as any).leionRoots, entries);
-            }
-            return entries;
-        }
-        for (const [key, value] of Object.entries(parsed || {})) {
-            if (key.startsWith('intentRouter.') || key.startsWith('leionRoots.')) {
-                entries[key] = value;
-                continue;
-            }
-            if (value && typeof value === 'object' && !Array.isArray(value)) {
-                flattenConfig(`intentRouter.${key}`, value, entries);
-            } else {
-                entries[`intentRouter.${key}`] = value;
-            }
-        }
-        return entries;
-    } catch {
-        return {};
-    }
-}
 
 function collectIntentNames(value: any, output: string[]): void {
     if (!value || typeof value !== 'object') {
@@ -287,5 +242,9 @@ export class CoreRuntime {
 
     get_workspace_root(): string {
         return this.workspaceRoot;
+    }
+
+    on_event(listener: (event: any) => void): Disposable {
+        return pipelineEventBus.on(listener);
     }
 }

@@ -1,15 +1,20 @@
 {
-  "name": "@leion-roots/cli",
+  "name": "@leion-roots/tui",
   "version": "0.1.0",
   "private": true,
   "main": "out/index.js",
   "bin": {
-    "leion-roots": "out/index.js"
+    "leion-roots-tui": "out/index.js"
   },
   "scripts": {
     "build": "npm --prefix ../core run build && tsc -p ./tsconfig.json"
   },
   "dependencies": {
-    "commander": "^14.0.3"
+    "ink": "^3.2.0",
+    "react": "^17.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "^17.0.79"
   }
 }
+

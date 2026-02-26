@@ -533,4 +533,39 @@ export class DslMutationService {
         this.writePipeline(filePath, pipeline);
         return { path: filePath, pipeline, removed: targetId };
     }
+
+    reorder_nodes(pipelineRef: string, orderedNodePositions: string[]): { path: string; pipeline: any } {
+        const filePath = this.resolvePipelinePath(pipelineRef);
+        const pipeline = this.readPipeline(filePath);
+        const steps = Array.isArray(pipeline.steps) ? pipeline.steps : [];
+        const normalized = Array.isArray(orderedNodePositions)
+            ? orderedNodePositions.map((entry) => String(entry || '').trim()).filter(Boolean)
+            : [];
+        if (!normalized.length) {
+            throw new Error('orderedNodePositions must contain at least one node_position.');
+        }
+
+        const existingIds = steps.map((step: any) => String(step?.id || '').trim());
+        const existingSet = new Set(existingIds);
+        const orderSet = new Set(normalized);
+        if (orderSet.size !== normalized.length) {
+            throw new Error('orderedNodePositions contains duplicates.');
+        }
+        if (normalized.length !== existingIds.length) {
+            throw new Error(`orderedNodePositions length mismatch: expected ${existingIds.length}, got ${normalized.length}.`);
+        }
+        for (const id of normalized) {
+            if (!existingSet.has(id)) {
+                throw new Error(`orderedNodePositions contains unknown id: ${id}`);
+            }
+        }
+
+        const byId = new Map<string, any>();
+        for (const step of steps) {
+            byId.set(String(step?.id || '').trim(), step);
+        }
+        pipeline.steps = normalized.map((id) => byId.get(id));
+        this.writePipeline(filePath, pipeline);
+        return { path: filePath, pipeline };
+    }
 }

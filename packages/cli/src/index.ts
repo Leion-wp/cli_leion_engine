@@ -3,41 +3,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
 import * as readline from 'readline/promises';
+import { Command } from 'commander';
 
 const core: any = require('../../core/out/index');
-
-type ParsedArgs = {
-    command: string;
-    flags: Record<string, string | boolean>;
-    positionals: string[];
-};
-
-function parseArgs(argv: string[]): ParsedArgs {
-    const flags: Record<string, string | boolean> = {};
-    const positionals: string[] = [];
-
-    for (let index = 0; index < argv.length; index += 1) {
-        const token = argv[index];
-        if (token.startsWith('--')) {
-            const key = token.slice(2);
-            const next = argv[index + 1];
-            if (next !== undefined && !next.startsWith('--')) {
-                flags[key] = next;
-                index += 1;
-            } else {
-                flags[key] = true;
-            }
-            continue;
-        }
-        positionals.push(token);
-    }
-
-    return {
-        command: String(positionals[0] || '').trim(),
-        flags,
-        positionals
-    };
-}
 
 function getWorkspaceRoot(flags: Record<string, string | boolean>): string {
     const fromFlag = String(flags.workspace || '').trim();
@@ -131,6 +99,160 @@ async function askChoice(title: string, options: string[], defaultIndex = 0): Pr
     return options[Math.floor(parsed) - 1];
 }
 
+async function askYesNo(prompt: string, defaultYes = true): Promise<boolean> {
+    const defaultLabel = defaultYes ? 'y' : 'n';
+    const answer = await askInput(`${prompt} (y/n)`, defaultLabel);
+    const raw = String(answer || defaultLabel).trim().toLowerCase();
+    if (!raw) return defaultYes;
+    return raw === 'y' || raw === 'yes' || raw === '1' || raw === 'true';
+}
+
+function toYamlScalar(value: any): string {
+    if (value === undefined || value === null) return "''";
+    const text = String(value);
+    if (!text) return "''";
+    const escaped = text.replace(/\\/g, '\\\\').replace(/'/g, "''");
+    return `'${escaped}'`;
+}
+
+function buildNodeYaml(node: {
+    type: string;
+    node_position: string;
+    description?: string;
+    on_failure?: string;
+    intent?: string;
+    payload?: any;
+}): string {
+    const lines: string[] = [];
+    lines.push(`type: ${node.type}`);
+    lines.push(`node_position: ${toYamlScalar(node.node_position)}`);
+    if (node.description) lines.push(`description: ${toYamlScalar(node.description)}`);
+    if (node.on_failure) lines.push(`on_failure: ${toYamlScalar(node.on_failure)}`);
+    if (node.intent) lines.push(`intent: ${toYamlScalar(node.intent)}`);
+    if (node.payload !== undefined) {
+        lines.push('payload:');
+        lines.push(`  ${JSON.stringify(node.payload)}`);
+    }
+    return lines.join('\n');
+}
+
+async function buildInteractiveNodeYaml(existingIds: Set<string>): Promise<string | undefined> {
+    const type = await askChoice(
+        'Node type',
+        ['action', 'script', 'http', 'prompt', 'switch', 'loop', 'sub_pipeline'],
+        0
+    );
+    if (!type) return undefined;
+
+    let nodePosition = '';
+    while (!nodePosition) {
+        const proposed = await askInput('node_position (unique step id)');
+        const normalized = String(proposed || '').trim();
+        if (!normalized) {
+            process.stderr.write('node_position is required.\n');
+            continue;
+        }
+        if (existingIds.has(normalized)) {
+            process.stderr.write(`node_position "${normalized}" already exists.\n`);
+            continue;
+        }
+        nodePosition = normalized;
+    }
+
+    const description = await askInput('description (optional)');
+    const onFailure = await askInput('on_failure target id (optional)');
+
+    if (type === 'action') {
+        const intent = String(await askInput('intent (ex: terminal.run)', 'terminal.run') || 'terminal.run').trim();
+        if (!intent || intent.toLowerCase().startsWith('vscode.')) {
+            throw new Error('Interactive add_node rejects empty or vscode.* intent.');
+        }
+        const payloadRaw = await askInput('payload JSON (optional)', '{}');
+        let payload: any = {};
+        if (String(payloadRaw || '').trim()) {
+            payload = JSON.parse(String(payloadRaw || '{}'));
+        }
+        return buildNodeYaml({
+            type: 'action',
+            node_position: nodePosition,
+            description: description || undefined,
+            on_failure: onFailure || undefined,
+            intent,
+            payload
+        });
+    }
+
+    if (type === 'script') {
+        const scriptPath = String(await askInput('script_path', './script.sh') || './script.sh').trim();
+        return [
+            `type: script`,
+            `node_position: ${toYamlScalar(nodePosition)}`,
+            ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+            ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+            `script_path: ${toYamlScalar(scriptPath)}`
+        ].join('\n');
+    }
+
+    if (type === 'http') {
+        const url = String(await askInput('url', 'https://example.com') || 'https://example.com').trim();
+        const method = String(await askInput('method', 'GET') || 'GET').trim().toUpperCase();
+        return [
+            `type: http`,
+            `node_position: ${toYamlScalar(nodePosition)}`,
+            ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+            ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+            `url: ${toYamlScalar(url)}`,
+            `method: ${toYamlScalar(method)}`
+        ].join('\n');
+    }
+
+    if (type === 'prompt') {
+        const name = String(await askInput('name (variable key)', 'input_var') || 'input_var').trim();
+        const value = String(await askInput('value (default)', '') || '').trim();
+        return [
+            `type: prompt`,
+            `node_position: ${toYamlScalar(nodePosition)}`,
+            ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+            ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+            `name: ${toYamlScalar(name)}`,
+            `value: ${toYamlScalar(value)}`
+        ].join('\n');
+    }
+
+    if (type === 'sub_pipeline') {
+        const pipelinePath = String(await askInput('pipeline_path', './pipeline/child.intent.json') || './pipeline/child.intent.json').trim();
+        return [
+            `type: sub_pipeline`,
+            `node_position: ${toYamlScalar(nodePosition)}`,
+            ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+            ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+            `pipeline_path: ${toYamlScalar(pipelinePath)}`
+        ].join('\n');
+    }
+
+    if (type === 'loop') {
+        const pipelinePath = String(await askInput('pipeline_path (optional child)', '') || '').trim();
+        return [
+            `type: loop`,
+            `node_position: ${toYamlScalar(nodePosition)}`,
+            ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+            ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+            ...(pipelinePath ? [`pipeline_path: ${toYamlScalar(pipelinePath)}`] : [])
+        ].join('\n');
+    }
+
+    const variableKey = String(await askInput('variable_key', 'route_key') || 'route_key').trim();
+    const defaultStepId = String(await askInput('default_step_id (optional)', '') || '').trim();
+    return [
+        `type: switch`,
+        `node_position: ${toYamlScalar(nodePosition)}`,
+        ...(description ? [`description: ${toYamlScalar(description)}`] : []),
+        ...(onFailure ? [`on_failure: ${toYamlScalar(onFailure)}`] : []),
+        `variable_key: ${toYamlScalar(variableKey)}`,
+        ...(defaultStepId ? [`default_step_id: ${toYamlScalar(defaultStepId)}`] : [])
+    ].join('\n');
+}
+
 function createRuntime(workspaceRoot: string, verbose: boolean): any {
     const blockedIntentPrefixes = ['vscode.'];
     return new core.CoreRuntime({
@@ -190,57 +312,41 @@ function createRuntime(workspaceRoot: string, verbose: boolean): any {
     });
 }
 
-function getRunsDir(workspaceRoot: string): string {
-    const dir = path.join(workspaceRoot, '.intent-router', 'runs');
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
-}
-
-function stateFilePath(workspaceRoot: string, detachedRunId: string): string {
-    return path.join(getRunsDir(workspaceRoot), `${detachedRunId}.json`);
-}
-
-function ctrlFilePath(workspaceRoot: string, detachedRunId: string): string {
-    return path.join(getRunsDir(workspaceRoot), `${detachedRunId}.ctrl.json`);
-}
-
-function writeJson(filePath: string, value: any): void {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}
-
-function readJson(filePath: string): any {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-}
-
-function generateDetachedRunId(): string {
-    return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function findRunState(workspaceRoot: string, runId: string): { filePath: string; state: any } | undefined {
-    const normalized = String(runId || '').trim();
-    if (!normalized) return undefined;
-    const dir = getRunsDir(workspaceRoot);
-    const files = fs.readdirSync(dir).filter((entry) => entry.endsWith('.json') && !entry.endsWith('.ctrl.json'));
-    for (const fileName of files) {
-        const filePath = path.join(dir, fileName);
-        try {
-            const state = readJson(filePath);
-            if (
-                String(state?.detachedRunId || '') === normalized
-                || String(state?.pipelineRunId || '') === normalized
-            ) {
-                return { filePath, state };
-            }
-        } catch {
-            // ignore malformed state files
-        }
+function loadPipelineStepIds(workspaceRoot: string, pipelineRef: string): Set<string> {
+    const filePath = resolvePipelineRuntimePath(workspaceRoot, pipelineRef);
+    if (!fs.existsSync(filePath)) {
+        return new Set<string>();
     }
-    return undefined;
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const steps = Array.isArray(parsed?.steps) ? parsed.steps : [];
+    return new Set<string>(steps.map((step: any) => String(step?.id || '').trim()).filter(Boolean));
+}
+
+async function runInteractiveAddNodeLoop(workspaceRoot: string, pipelineRef: string, service: any): Promise<void> {
+    if (!process.stdin.isTTY) {
+        return;
+    }
+    const existingIds = loadPipelineStepIds(workspaceRoot, pipelineRef);
+    const shouldStart = await askYesNo('Add a node now?', true);
+    if (!shouldStart) return;
+
+    while (true) {
+        const yamlPayload = await buildInteractiveNodeYaml(existingIds);
+        if (!yamlPayload) return;
+        const result = service.add_node(pipelineRef, yamlPayload);
+        const newId = String(result?.pipeline?.steps?.[result.pipeline.steps.length - 1]?.id || '').trim();
+        if (newId) existingIds.add(newId);
+        process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        const again = await askYesNo('Add another node?', false);
+        if (!again) return;
+    }
 }
 
 async function handleCreatePipeline(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
-    const name = String(flags.name || '').trim();
+    let name = String(flags.name || '').trim();
+    if (!name && asBool(flags.interactive) && process.stdin.isTTY) {
+        name = String(await askInput('Pipeline name') || '').trim();
+    }
     if (!name) {
         throw new Error('create_pipeline requires --name');
     }
@@ -248,6 +354,9 @@ async function handleCreatePipeline(workspaceRoot: string, flags: Record<string,
     const service = new core.DslMutationService(workspaceRoot);
     const result = service.create_pipeline(name, description);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (asBool(flags.interactive)) {
+        await runInteractiveAddNodeLoop(workspaceRoot, name, service);
+    }
 }
 
 async function handleDeletePipeline(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -276,8 +385,12 @@ async function handleAddNode(workspaceRoot: string, flags: Record<string, string
     if (!pipeline) {
         throw new Error('add_node requires --pipeline');
     }
-    const yamlPayload = await readYamlArg(flags);
     const service = new core.DslMutationService(workspaceRoot);
+    if (asBool(flags.interactive)) {
+        await runInteractiveAddNodeLoop(workspaceRoot, pipeline, service);
+        return;
+    }
+    const yamlPayload = await readYamlArg(flags);
     const result = service.add_node(pipeline, yamlPayload);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
@@ -307,84 +420,19 @@ async function handleReplaceNode(workspaceRoot: string, flags: Record<string, st
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-async function runWorker(flags: Record<string, string | boolean>): Promise<void> {
-    const workspaceRoot = getWorkspaceRoot(flags);
-    const verbose = asBool(flags.verbose);
-    const detachedRunId = String(flags.run_id || '').trim();
+async function handleReorderNodes(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
     const pipeline = String(flags.pipeline || '').trim();
-    const pipelinePath = resolvePipelineRuntimePath(workspaceRoot, pipeline);
-    const from = String(flags.from || '').trim() || undefined;
-    const dryRun = asBool(flags.dry_run);
-
-    if (!detachedRunId || !pipeline) {
-        throw new Error('__worker_run requires --run_id and --pipeline');
+    const orderRaw = String(flags.order || '').trim();
+    if (!pipeline) {
+        throw new Error('reorder_nodes requires --pipeline');
     }
-
-    const runtime = createRuntime(workspaceRoot, verbose);
-    const statePath = stateFilePath(workspaceRoot, detachedRunId);
-    const controlPath = ctrlFilePath(workspaceRoot, detachedRunId);
-    const eventBus = require('../../core/out/eventBus').pipelineEventBus;
-
-    let lastControlTimestamp = 0;
-    const disposable = eventBus.on((event: any) => {
-        if (event?.type !== 'pipelineStart') return;
-        const state = fs.existsSync(statePath) ? readJson(statePath) : {};
-        state.pipelineRunId = String(event.runId || '');
-        state.status = 'running';
-        state.updatedAt = Date.now();
-        writeJson(statePath, state);
-    });
-
-    const interval = setInterval(() => {
-        if (!fs.existsSync(controlPath)) {
-            return;
-        }
-        try {
-            const control = readJson(controlPath);
-            const updatedAt = Number(control?.updatedAt || 0);
-            if (!Number.isFinite(updatedAt) || updatedAt <= lastControlTimestamp) {
-                return;
-            }
-            lastControlTimestamp = updatedAt;
-            const action = String(control?.action || '').trim();
-            const state = fs.existsSync(statePath) ? readJson(statePath) : {};
-            const targetRunId = String(state?.pipelineRunId || detachedRunId);
-            if (action === 'pause') runtime.pause(targetRunId);
-            if (action === 'resume') runtime.resume(targetRunId);
-            if (action === 'cancel' || action === 'stop') runtime.cancel(targetRunId);
-        } catch {
-            // ignore malformed control state
-        }
-    }, 300);
-
-    try {
-        const result = await runtime.run_pipeline_file(pipelinePath, {
-            dryRun,
-            from
-        });
-        const state = fs.existsSync(statePath) ? readJson(statePath) : {};
-        state.status = result?.status || (result?.success ? 'success' : 'failure');
-        state.result = result;
-        state.updatedAt = Date.now();
-        state.endedAt = Date.now();
-        writeJson(statePath, state);
-        process.exit(result?.success ? 0 : 1);
-    } catch (error: any) {
-        const state = fs.existsSync(statePath) ? readJson(statePath) : {};
-        state.status = 'failure';
-        state.error = String(error?.message || error || 'Unknown worker failure');
-        state.updatedAt = Date.now();
-        state.endedAt = Date.now();
-        writeJson(statePath, state);
-        process.exit(1);
-    } finally {
-        clearInterval(interval);
-        try {
-            disposable.dispose();
-        } catch {
-            // noop
-        }
+    if (!orderRaw) {
+        throw new Error('reorder_nodes requires --order <id1,id2,...>');
     }
+    const orderedNodePositions = orderRaw.split(',').map((entry) => entry.trim()).filter(Boolean);
+    const service = new core.DslMutationService(workspaceRoot);
+    const result = service.reorder_nodes(pipeline, orderedNodePositions);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function handleRunPipeline(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -412,77 +460,33 @@ async function handleRunPipeline(workspaceRoot: string, flags: Record<string, st
         return;
     }
 
-    const detachedRunId = generateDetachedRunId();
-    const state = {
-        detachedRunId,
-        workspaceRoot,
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    const result = supervisor.start_detached({
         pipeline,
         from,
         dryRun,
-        status: 'starting',
-        startedAt: Date.now(),
-        updatedAt: Date.now()
-    };
-    writeJson(stateFilePath(workspaceRoot, detachedRunId), state);
-
-    const cliEntry = path.resolve(__dirname, 'index.js');
-    const args = [cliEntry, '__worker_run', '--run_id', detachedRunId, '--pipeline', pipeline, '--workspace', workspaceRoot];
-    if (from) args.push('--from', from);
-    if (dryRun) args.push('--dry_run');
-    if (verbose) args.push('--verbose');
-
-    const child = cp.spawn(process.execPath, args, {
-        cwd: workspaceRoot,
-        detached: true,
-        stdio: 'ignore'
+        verbose
     });
-    child.unref();
-
-    const nextState = readJson(stateFilePath(workspaceRoot, detachedRunId));
-    nextState.pid = child.pid;
-    nextState.updatedAt = Date.now();
-    writeJson(stateFilePath(workspaceRoot, detachedRunId), nextState);
-
-    process.stdout.write(`${JSON.stringify({ run_id: detachedRunId, pid: child.pid, status: 'detached' }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-async function writeControlCommand(workspaceRoot: string, flags: Record<string, string | boolean>, action: 'pause' | 'resume'): Promise<void> {
+async function writeControlCommand(workspaceRoot: string, flags: Record<string, string | boolean>, action: 'pause' | 'resume' | 'cancel'): Promise<void> {
     const requestedRunId = String(flags.run_id || '').trim();
     if (!requestedRunId) {
-        throw new Error(`${action === 'pause' ? 'stop_pipeline' : 'resume_pipeline'} requires --run_id`);
+        if (action === 'pause') throw new Error('stop_pipeline requires --run_id');
+        if (action === 'resume') throw new Error('resume_pipeline requires --run_id');
+        throw new Error('cancel_pipeline requires --run_id');
     }
-    const located = findRunState(workspaceRoot, requestedRunId);
-    if (!located) {
-        throw new Error(`Run not found for id: ${requestedRunId}`);
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    let result: any;
+    if (action === 'pause') {
+        result = supervisor.pause_run(requestedRunId);
+    } else if (action === 'resume') {
+        result = supervisor.resume_run(requestedRunId);
+    } else {
+        result = supervisor.cancel_run(requestedRunId);
     }
-    const detachedRunId = String(located.state?.detachedRunId || '').trim();
-    if (!detachedRunId) {
-        throw new Error(`Detached run id is missing in state file for ${requestedRunId}`);
-    }
-
-    writeJson(ctrlFilePath(workspaceRoot, detachedRunId), {
-        action,
-        requestedRunId,
-        updatedAt: Date.now()
-    });
-
-    const pid = Number(located.state?.pid || 0);
-    if (Number.isFinite(pid) && pid > 0) {
-        try {
-            if (process.platform !== 'win32') {
-                process.kill(pid, action === 'pause' ? 'SIGSTOP' : 'SIGCONT');
-            }
-        } catch {
-            // Best effort signal fallback.
-        }
-    }
-
-    located.state.updatedAt = Date.now();
-    located.state.lastControl = action;
-    located.state.status = action === 'pause' ? 'paused' : 'running';
-    writeJson(located.filePath, located.state);
-
-    process.stdout.write(`${JSON.stringify({ run_id: requestedRunId, detached_run_id: detachedRunId, action }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function handleRouteIntent(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -546,99 +550,176 @@ async function handleTriggersServe(workspaceRoot: string, flags: Record<string, 
     });
 }
 
-function printHelp(): void {
-    const lines = [
-        'Leion Roots CLI',
-        '',
-        'Commands:',
-        '  create_pipeline --name <name> [--description "..."] [--verbose]',
-        '  delete_pipeline --pipeline <path|name> [--verbose]',
-        '  edit_pipeline --pipeline <path|name> --yaml <payload|-> [--verbose]',
-        '  add_node --pipeline <path|name> --yaml <payload|-> [--verbose]',
-        '  delete_node --pipeline <path|name> --node_position <id> [--verbose]',
-        '  replace_node --pipeline <path|name> --yaml <payload|-> [--verbose]',
-        '  run_pipeline --pipeline <path|name> [--from <node_position>] [--dry_run] [--detached] [--verbose]',
-        '  stop_pipeline --run_id <id> [--verbose]',
-        '  resume_pipeline --run_id <id> [--verbose]',
-        '  route_intent --intent_json <json|@file> [--verbose]',
-        '  history_list [--verbose]',
-        '  history_show --run_id <id> [--verbose]',
-        '  history_clear [--verbose]',
-        '  triggers_serve [--verbose]'
-    ];
-    process.stdout.write(`${lines.join('\n')}\n`);
+async function handleTui(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
+    const tuiEntry = path.resolve(__dirname, '../../tui/out/index.js');
+    if (!fs.existsSync(tuiEntry)) {
+        throw new Error(`TUI build not found: ${tuiEntry}. Run npm run build:tui.`);
+    }
+    const args = [tuiEntry, '--workspace', workspaceRoot];
+    const runId = String(flags.run_id || '').trim();
+    if (runId) args.push('--run_id', runId);
+    const pipeline = String(flags.pipeline || '').trim();
+    if (pipeline) args.push('--pipeline', pipeline);
+    await new Promise<void>((resolve, reject) => {
+        const child = cp.spawn(process.execPath, args, {
+            cwd: workspaceRoot,
+            stdio: 'inherit'
+        });
+        child.on('exit', (code) => {
+            if (Number(code || 0) !== 0) {
+                reject(new Error(`TUI exited with code ${String(code)}`));
+                return;
+            }
+            resolve();
+        });
+        child.on('error', reject);
+    });
+}
+
+function withCommonOptions(command: Command): Command {
+    return command
+        .option('--workspace <path>', 'Workspace root (default: current directory)')
+        .option('--verbose', 'Enable verbose logs');
+}
+
+function asFlagMap(input: Record<string, any>): Record<string, string | boolean> {
+    const out: Record<string, string | boolean> = {};
+    for (const [key, value] of Object.entries(input || {})) {
+        if (value === undefined) continue;
+        if (typeof value === 'boolean') {
+            if (value) out[key] = true;
+            continue;
+        }
+        out[key] = String(value);
+    }
+    return out;
+}
+
+async function runWithWorkspace(
+    options: Record<string, any>,
+    fn: (workspaceRoot: string, flags: Record<string, string | boolean>) => Promise<void>
+): Promise<void> {
+    const flags = asFlagMap(options);
+    const workspaceRoot = getWorkspaceRoot(flags);
+    await fn(workspaceRoot, flags);
+}
+
+function buildProgram(): Command {
+    const program = new Command();
+    program
+        .name('leion-roots')
+        .description('Leion Roots CLI')
+        .showHelpAfterError('(use --help for usage)')
+        .allowExcessArguments(false);
+
+    withCommonOptions(program.command('create_pipeline'))
+        .description('Create a new pipeline')
+        .option('--name <name>', 'Pipeline name')
+        .option('--description <description>', 'Pipeline description')
+        .option('--interactive', 'Create then open interactive node wizard')
+        .action(async (options) => runWithWorkspace(options, handleCreatePipeline));
+
+    withCommonOptions(program.command('delete_pipeline'))
+        .description('Delete a pipeline file')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .action(async (options) => runWithWorkspace(options, handleDeletePipeline));
+
+    withCommonOptions(program.command('edit_pipeline'))
+        .description('Replace pipeline steps from YAML payload')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .requiredOption('--yaml <payload|->', 'Inline YAML payload or - for stdin')
+        .action(async (options) => runWithWorkspace(options, handleEditPipeline));
+
+    withCommonOptions(program.command('add_node'))
+        .description('Add node(s) to pipeline from YAML payload or interactive wizard')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .option('--yaml <payload|->', 'Inline YAML payload or - for stdin')
+        .option('--interactive', 'Open interactive node wizard')
+        .action(async (options) => {
+            if (!options.yaml && !options.interactive) {
+                throw new Error('add_node requires --yaml or --interactive');
+            }
+            await runWithWorkspace(options, handleAddNode);
+        });
+
+    withCommonOptions(program.command('delete_node'))
+        .description('Delete one node by node_position')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .requiredOption('--node_position <id>', 'Node position (step id)')
+        .action(async (options) => runWithWorkspace(options, handleDeleteNode));
+
+    withCommonOptions(program.command('replace_node'))
+        .description('Replace one node by node_position using YAML payload')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .requiredOption('--yaml <payload|->', 'Inline YAML payload or - for stdin')
+        .action(async (options) => runWithWorkspace(options, handleReplaceNode));
+
+    withCommonOptions(program.command('reorder_nodes'))
+        .description('Reorder nodes by ordered node_position list')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .requiredOption('--order <id1,id2,...>', 'Ordered node_position list')
+        .action(async (options) => runWithWorkspace(options, handleReorderNodes));
+
+    withCommonOptions(program.command('run_pipeline'))
+        .description('Run a pipeline from file')
+        .requiredOption('--pipeline <path|name>', 'Pipeline reference')
+        .option('--from <node_position>', 'Start from node_position/step.id')
+        .option('--dry_run', 'Run in dry run mode')
+        .option('--detached', 'Run detached in background')
+        .action(async (options) => runWithWorkspace(options, handleRunPipeline));
+
+    withCommonOptions(program.command('stop_pipeline'))
+        .description('Request checkpoint pause for a detached pipeline run')
+        .requiredOption('--run_id <id>', 'Run id')
+        .action(async (options) => runWithWorkspace(options, (workspaceRoot, flags) => writeControlCommand(workspaceRoot, flags, 'pause')));
+
+    withCommonOptions(program.command('resume_pipeline'))
+        .description('Resume a checkpoint-paused detached pipeline run')
+        .requiredOption('--run_id <id>', 'Run id')
+        .action(async (options) => runWithWorkspace(options, (workspaceRoot, flags) => writeControlCommand(workspaceRoot, flags, 'resume')));
+
+    withCommonOptions(program.command('cancel_pipeline'))
+        .description('Cancel a detached pipeline run')
+        .requiredOption('--run_id <id>', 'Run id')
+        .action(async (options) => runWithWorkspace(options, (workspaceRoot, flags) => writeControlCommand(workspaceRoot, flags, 'cancel')));
+
+    withCommonOptions(program.command('route_intent'))
+        .description('Resolve and execute one intent JSON payload')
+        .requiredOption('--intent_json <json|@file>', 'Inline JSON or @file path')
+        .action(async (options) => runWithWorkspace(options, handleRouteIntent));
+
+    withCommonOptions(program.command('history_list'))
+        .description('List historical pipeline runs')
+        .action(async (options) => runWithWorkspace(options, handleHistoryList));
+
+    withCommonOptions(program.command('history_show'))
+        .description('Show one run history entry')
+        .requiredOption('--run_id <id>', 'Run id')
+        .action(async (options) => runWithWorkspace(options, handleHistoryShow));
+
+    withCommonOptions(program.command('history_clear'))
+        .description('Clear runtime history')
+        .action(async (options) => runWithWorkspace(options, handleHistoryClear));
+
+    withCommonOptions(program.command('triggers_serve'))
+        .description('Start trigger daemon')
+        .action(async (options) => runWithWorkspace(options, handleTriggersServe));
+
+    withCommonOptions(program.command('tui'))
+        .description('Start Leion TUI')
+        .option('--run_id <id>', 'Open run-focused mode')
+        .option('--pipeline <path|name>', 'Open pipeline-focused mode')
+        .action(async (options) => runWithWorkspace(options, handleTui));
+
+    return program;
 }
 
 async function main(): Promise<void> {
-    const parsed = parseArgs(process.argv.slice(2));
-    if (!parsed.command || parsed.command === 'help' || parsed.command === '--help') {
-        printHelp();
-        return;
-    }
-
-    if (parsed.command === '__worker_run') {
-        await runWorker(parsed.flags);
-        return;
-    }
-
-    const workspaceRoot = getWorkspaceRoot(parsed.flags);
-
-    switch (parsed.command) {
-        case 'create_pipeline':
-            await handleCreatePipeline(workspaceRoot, parsed.flags);
-            return;
-        case 'delete_pipeline':
-            await handleDeletePipeline(workspaceRoot, parsed.flags);
-            return;
-        case 'edit_pipeline':
-            await handleEditPipeline(workspaceRoot, parsed.flags);
-            return;
-        case 'add_node':
-            await handleAddNode(workspaceRoot, parsed.flags);
-            return;
-        case 'delete_node':
-            await handleDeleteNode(workspaceRoot, parsed.flags);
-            return;
-        case 'replace_node':
-            await handleReplaceNode(workspaceRoot, parsed.flags);
-            return;
-        case 'run_pipeline':
-            await handleRunPipeline(workspaceRoot, parsed.flags);
-            return;
-        case 'stop_pipeline':
-            await writeControlCommand(workspaceRoot, parsed.flags, 'pause');
-            return;
-        case 'resume_pipeline':
-            await writeControlCommand(workspaceRoot, parsed.flags, 'resume');
-            return;
-        case 'route_intent':
-            await handleRouteIntent(workspaceRoot, parsed.flags);
-            return;
-        case 'history_list':
-            await handleHistoryList(workspaceRoot, parsed.flags);
-            return;
-        case 'history_show':
-            await handleHistoryShow(workspaceRoot, parsed.flags);
-            return;
-        case 'history_clear':
-            await handleHistoryClear(workspaceRoot, parsed.flags);
-            return;
-        case 'triggers_serve':
-            await handleTriggersServe(workspaceRoot, parsed.flags);
-            return;
-        default:
-            throw new Error(`Unknown command: ${parsed.command}`);
-    }
+    const program = buildProgram();
+    await program.parseAsync(process.argv);
 }
 
-main()
-    .then(() => {
-        const command = String(process.argv[2] || '').trim();
-        if (command !== '__worker_run' && command !== 'triggers_serve') {
-            process.exit(process.exitCode ?? 0);
-        }
-    })
-    .catch((error: any) => {
-        process.stderr.write(`${String(error?.message || error)}\n`);
-        process.exit(1);
-    });
+main().catch((error: any) => {
+    process.stderr.write(`${String(error?.message || error)}\n`);
+    process.exit(1);
+});

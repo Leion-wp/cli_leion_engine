@@ -27,7 +27,9 @@ function doRegister() {
             }
         ]
     });
-    console.log('[Intent Router] Registered Terminal provider capabilities.');
+    if (process.env.LEION_SILENT_PROVIDER_LOGS !== '1') {
+        console.log('[Intent Router] Registered Terminal provider capabilities.');
+    }
 }
 
 export const terminalTemplates: Record<string, any> = {

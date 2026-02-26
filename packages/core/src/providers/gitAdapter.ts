@@ -61,7 +61,9 @@ function doRegister() {
             }
         ]
     });
-    console.log('[Intent Router] Registered Git provider capabilities.');
+    if (process.env.LEION_SILENT_PROVIDER_LOGS !== '1') {
+        console.log('[Intent Router] Registered Git provider capabilities.');
+    }
 }
 
 export const gitTemplates: Record<string, any> = {

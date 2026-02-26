@@ -3,3 +3,8 @@ export * from './coreRuntime';
 export * from './historyService';
 export * from './dslMutationService';
 export * from './ports/vscodeShim';
+export * from './services/pipelineCatalogService';
+export * from './services/runSupervisorService';
+export * from './services/triggerService';
+export * from './services/approvalInboxService';
+export * from './services/diffService';

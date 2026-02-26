@@ -34,7 +34,9 @@ function doRegister() {
             }
         ]
     });
-    console.log('[Intent Router] Registered Docker provider capabilities.');
+    if (process.env.LEION_SILENT_PROVIDER_LOGS !== '1') {
+        console.log('[Intent Router] Registered Docker provider capabilities.');
+    }
 }
 
 export const dockerTemplates: Record<string, any> = {

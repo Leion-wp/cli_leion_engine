@@ -22,3 +22,8 @@ Thumbs.db
 # Local runtime data
 .intent-router/
 pipeline/*.intent.json
+pipeline/history.json
+
+*.sh
+
+docs/

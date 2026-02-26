@@ -1276,6 +1276,32 @@ async function runPipeline(
             const compiledStep = await compileStep(step, variableCache, currentCwd, trustedRoot);
             const intentId = compiledStep.meta?.traceId ?? generateSecureToken(8);
             pipelineEventBus.emit({ type: 'stepStart', runId, intentId, timestamp: Date.now(), description: compiledStep.description, intent: compiledStep.intent, index: currentIndex, stepId: compiledStep.id });
+            const intentName = String(compiledStep.intent || '').trim().toLowerCase();
+            const requiresApproval = (
+                intentName === 'vscode.reviewdiff'
+                || intentName === 'system.approval'
+                || compiledStep.payload?.requireApproval === true
+            );
+            if (requiresApproval) {
+                const rawPolicyMode = String(compiledStep.payload?.policyMode || '').trim().toLowerCase();
+                const policyMode = rawPolicyMode === 'block' || rawPolicyMode === 'warn'
+                    ? (rawPolicyMode as 'warn' | 'block')
+                    : undefined;
+                pipelineEventBus.emit({
+                    type: 'approval.request',
+                    runId,
+                    nodeId: String(compiledStep.id || step.id || intentId),
+                    stepId: String(compiledStep.id || step.id || ''),
+                    intentId,
+                    prompt: String(compiledStep.payload?.approvalPrompt || compiledStep.description || 'Approval required'),
+                    createdAt: Date.now(),
+                    policy: {
+                        mode: policyMode,
+                        blocked: compiledStep.payload?.policyBlocked === true,
+                        violations: Array.isArray(compiledStep.payload?.policyViolations) ? compiledStep.payload.policyViolations : undefined
+                    }
+                } as any);
+            }
 
             compiledStep.meta = {
                 ...(compiledStep.meta || {}),

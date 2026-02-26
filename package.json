@@ -4,16 +4,30 @@
   "version": "0.1.0",
   "workspaces": [
     "packages/core",
-    "packages/cli"
+    "packages/cli",
+    "packages/tui"
   ],
   "scripts": {
     "build:core": "npm --prefix packages/core run build",
     "build:cli": "npm --prefix packages/cli run build",
-    "build:all": "npm run build:core && npm run build:cli",
-    "cli": "node ./packages/cli/out/index.js"
+    "build:tui": "npm --prefix packages/tui run build",
+    "build:all": "npm run build:core && npm run build:cli && npm run build:tui",
+    "cli": "node ./packages/cli/out/index.js",
+    "tui": "node ./packages/tui/out/index.js",
+    "test:m1": "./scripts/m01-run-live-smoke.sh",
+    "test:m2": "./scripts/m02-pipelines-smoke.sh",
+    "test:m3": "./scripts/m03-editor-advanced-smoke.sh",
+    "test:m4": "./scripts/m04-history-diff-smoke.sh",
+    "test:m5": "./scripts/m05-triggers-smoke.sh",
+    "test:m6": "./scripts/m06-hitl-smoke.sh"
   },
   "devDependencies": {
-    "typescript": "^5.8.2",
-    "@types/node": "^22.15.3"
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "@oclif/core": "^4.8.1",
+    "commander": "^14.0.3",
+    "oclif": "^4.22.81"
   }
 }

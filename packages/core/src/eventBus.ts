@@ -45,6 +45,20 @@ export type PipelineEvent =
         base: string;
         title: string;
     }
+    | {
+        type: 'approval.request';
+        runId: string;
+        nodeId: string;
+        stepId?: string;
+        intentId?: string;
+        prompt?: string;
+        createdAt: number;
+        policy?: {
+            mode?: 'warn' | 'block';
+            blocked?: boolean;
+            violations?: string[];
+        };
+    }
     | { type: 'pipelineDecision'; nodeId?: string; runId?: string; approvedPaths?: string[]; decision: 'approve' | 'reject' }
     | { type: 'pipelineReviewOpenDiff'; nodeId?: string; runId?: string; path?: string }
     | { type: 'pipelinePause'; runId: string; timestamp: number }
