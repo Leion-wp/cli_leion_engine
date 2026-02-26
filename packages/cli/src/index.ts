@@ -560,6 +560,7 @@ async function handleTui(workspaceRoot: string, flags: Record<string, string | b
     if (runId) args.push('--run_id', runId);
     const pipeline = String(flags.pipeline || '').trim();
     if (pipeline) args.push('--pipeline', pipeline);
+    if (asBool(flags.legacy)) args.push('--legacy');
     await new Promise<void>((resolve, reject) => {
         const child = cp.spawn(process.execPath, args, {
             cwd: workspaceRoot,
@@ -709,6 +710,7 @@ function buildProgram(): Command {
         .description('Start Leion TUI')
         .option('--run_id <id>', 'Open run-focused mode')
         .option('--pipeline <path|name>', 'Open pipeline-focused mode')
+        .option('--legacy', 'Use legacy TUI shell')
         .action(async (options) => runWithWorkspace(options, handleTui));
 
     return program;

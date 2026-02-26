@@ -7,6 +7,7 @@ type ParsedArgs = {
     workspaceRoot: string;
     runId?: string;
     pipeline?: string;
+    legacy?: boolean;
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -28,7 +29,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     return {
         workspaceRoot,
         runId: String(flags.run_id || '').trim() || undefined,
-        pipeline: String(flags.pipeline || '').trim() || undefined
+        pipeline: String(flags.pipeline || '').trim() || undefined,
+        legacy: Boolean(flags.legacy)
     };
 }
 
@@ -44,6 +46,7 @@ function main(): void {
             workspaceRoot={parsed.workspaceRoot}
             initialRunId={parsed.runId}
             initialPipeline={parsed.pipeline}
+            legacyMode={parsed.legacy}
         />
     );
 }

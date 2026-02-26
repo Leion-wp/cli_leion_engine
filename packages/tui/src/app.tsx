@@ -1,251 +1,115 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import * as cp from 'child_process';
+import { LegacyApp } from './legacyApp';
+import { loadTuiConfig } from './state/config';
+import { defaultFocusForTab, resolveGlobalKeyAction } from './state/keymap';
+import { TAB_SHORTCUTS, createInitialUiState, uiReducer } from './state/machines';
+import { rankPaletteItems } from './state/palette';
+import { CommandPaletteItem, TabId, TuiRuntimeConfig } from './state/types';
+import {
+    buildActionNodeYaml,
+    buildAddNodeTemplate,
+    buildPipelineYaml,
+    editTextWithEditor,
+    generatePipelineName,
+    NODE_TEMPLATE_HINT,
+    normalizeNodeTemplateKey,
+    resolveEditorCommand
+} from './services/editorYaml';
+import {
+    boundedAppend,
+    formatEventLine,
+    formatTime,
+    tailWindow,
+    tryExtractLogLine
+} from './services/formatters';
+import { DiffScreen } from './screens/diffScreen';
+import { EditorScreen } from './screens/editorScreen';
+import { HistoryScreen } from './screens/historyScreen';
+import { HitlScreen } from './screens/hitlScreen';
+import { PipelinesScreen } from './screens/pipelinesScreen';
+import { RunScreen } from './screens/runScreen';
+import { TriggersScreen } from './screens/triggersScreen';
+import { CommandPalette } from './ui/palette';
+import { Footer, Header, TabBar } from './ui/primitives';
+import { ConfirmOverlay, HelpOverlay, PromptOverlay } from './ui/overlays';
+import { createTheme } from './ui/theme';
 
 const core: any = require('../../core/out/index');
-
-type TabId = 'run' | 'pipelines' | 'editor' | 'history' | 'diff' | 'triggers' | 'hitl';
 
 type AppProps = {
     workspaceRoot: string;
     initialRunId?: string;
     initialPipeline?: string;
+    legacyMode?: boolean;
 };
 
-type TuiRuntimeConfig = {
-    maxLogs: number;
-    maxEvents: number;
+type ModernAppProps = {
+    workspaceRoot: string;
+    initialRunId?: string;
+    initialPipeline?: string;
+    config: TuiRuntimeConfig;
 };
 
-const theme = {
-    bg: 'black',
-    fg: 'white',
-    muted: 'gray',
-    accent: 'cyan',
-    accent2: 'magenta',
-    ok: 'green',
-    warn: 'yellow',
-    err: 'red'
-} as const;
-
-function toPositiveInt(input: any, fallback: number): number {
-    const parsed = Number(input);
-    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-    return Math.floor(parsed);
+function toUpperSafe(value: unknown): string {
+    return String(value || '').trim().toUpperCase();
 }
 
-function loadTuiConfig(workspaceRoot: string): TuiRuntimeConfig {
-    const configPath = path.join(workspaceRoot, '.intent-router', 'config.json');
-    try {
-        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        const maxLogs = toPositiveInt(
-            parsed?.intentRouter?.tui?.logs?.maxLines ?? parsed?.['intentRouter.tui.logs.maxLines'],
-            2000
-        );
-        const maxEvents = toPositiveInt(
-            parsed?.intentRouter?.tui?.events?.maxItems ?? parsed?.['intentRouter.tui.events.maxItems'],
-            5000
-        );
-        return { maxLogs, maxEvents };
-    } catch {
-        return { maxLogs: 2000, maxEvents: 5000 };
-    }
-}
-
-function formatTime(value: any): string {
-    const ts = Number(value || Date.now());
-    if (!Number.isFinite(ts)) return '--:--:--';
-    return new Date(ts).toLocaleTimeString();
-}
-
-function boundedAppend(lines: string[], next: string[], maxItems: number): string[] {
-    const merged = [...lines, ...next];
-    if (merged.length <= maxItems) return merged;
-    return merged.slice(merged.length - maxItems);
-}
-
-function tailWindow(lines: string[], windowSize: number, offsetFromEnd: number): string[] {
-    const safeOffset = Math.max(0, offsetFromEnd);
-    const end = Math.max(0, lines.length - safeOffset);
-    const start = Math.max(0, end - Math.max(1, windowSize));
-    return lines.slice(start, end);
-}
-
-function formatEventLine(event: any): string {
-    const ts = formatTime(event?.ts);
-    const type = String(event?.type || 'unknown');
-    const payload = event?.payload || {};
-    if (type === 'stepLog') {
-        return `[${ts}] ${type}: ${String(payload?.text || '').trim()}`;
-    }
-    if (type === 'stepStart' || type === 'stepEnd') {
-        return `[${ts}] ${type} ${String(payload?.stepId || payload?.intentId || '')}`.trim();
-    }
-    if (type.startsWith('run.')) {
-        return `[${ts}] ${type}`;
-    }
-    return `[${ts}] ${type}`;
-}
-
-function tryExtractLogLine(event: any): string | undefined {
-    if (String(event?.type || '') !== 'stepLog') return undefined;
-    const payload = event?.payload || {};
-    const text = String(payload?.text || '').trim();
-    if (!text) return undefined;
-    return `[${formatTime(event?.ts)}] ${text}`;
-}
-
-function pad(label: string, active: boolean): string {
-    return active ? `> ${label}` : `  ${label}`;
-}
-
-function statusColor(status: string): 'green' | 'yellow' | 'red' | 'gray' | 'cyan' {
-    const normalized = String(status || '').trim().toLowerCase();
-    if (normalized === 'success' || normalized === 'running') return 'green';
-    if (normalized.includes('pause') || normalized === 'starting') return 'yellow';
-    if (normalized === 'failure' || normalized === 'cancelled' || normalized === 'cancel_requested') return 'red';
-    return 'gray';
-}
-
-function tabLabel(label: string, active: boolean): string {
-    return active ? label : label;
-}
-
-function sectionTitle(text: string): string {
-    return `┏ ${text}`;
-}
-
-function generatePipelineName(): string {
-    return `pipeline_${Date.now().toString(36).slice(-8)}`;
-}
-
-function escapeYamlSingleQuoted(value: string): string {
-    return String(value || '').replace(/'/g, "''");
-}
-
-function buildActionNodeYaml(step: any, patch?: {
-    intent?: string;
-    description?: string;
-    onFailure?: string;
-    payload?: any;
-}): string {
-    const id = String(step?.id || '').trim();
-    const intent = String(patch?.intent ?? step?.intent ?? '').trim();
-    const description = patch?.description ?? step?.description;
-    const onFailure = patch?.onFailure ?? step?.onFailure;
-    const payload = patch?.payload ?? step?.payload ?? {};
-    const lines: string[] = [];
-    lines.push('type: action');
-    lines.push(`node_position: '${escapeYamlSingleQuoted(id)}'`);
-    lines.push(`intent: '${escapeYamlSingleQuoted(intent)}'`);
-    if (String(description || '').trim()) {
-        lines.push(`description: '${escapeYamlSingleQuoted(String(description).trim())}'`);
-    }
-    if (String(onFailure || '').trim()) {
-        lines.push(`on_failure: '${escapeYamlSingleQuoted(String(onFailure).trim())}'`);
-    }
-    lines.push('payload:');
-    lines.push(`  ${JSON.stringify(payload)}`);
-    return lines.join('\n');
-}
-
-function buildPipelineYaml(pipeline: any): string {
-    const pipelineName = String(pipeline?.name || '').trim();
-    const pipelineDescription = String(pipeline?.description || '').trim();
-    const steps = Array.isArray(pipeline?.steps) ? pipeline.steps : [];
-    const lines: string[] = [];
-    lines.push('nodes:');
-    lines.push('  - type: start');
-    if (pipelineName) {
-        lines.push(`    pipeline_name: '${escapeYamlSingleQuoted(pipelineName)}'`);
-    }
-    if (pipelineDescription) {
-        lines.push(`    description: '${escapeYamlSingleQuoted(pipelineDescription)}'`);
-    }
-    for (const step of steps) {
-        const nodeYaml = buildActionNodeYaml(step)
-            .split('\n')
-            .map((line) => `    ${line}`)
-            .join('\n');
-        lines.push('  -');
-        lines.push(nodeYaml);
-    }
-    return lines.join('\n');
-}
-
-function buildAddNodeTemplate(nextId: string): string {
-    return [
-        `type: action`,
-        `node_position: '${escapeYamlSingleQuoted(nextId)}'`,
-        `description: 'New runtime step'`,
-        `intent: 'terminal.run'`,
-        `payload:`,
-        `  {"command":"echo ${nextId}"}`
-    ].join('\n');
-}
-
-function editTextWithEditor(initialText: string): { ok: boolean; text?: string; error?: string } {
-    const tempFile = path.join(os.tmpdir(), `leion-node-${Date.now().toString(36)}.yaml`);
-    const decorated = [
-        '# Leion TUI YAML Editor',
-        '# Save + quit to apply. Leave node_position unchanged.',
-        '',
-        initialText
-    ].join('\n');
-    fs.writeFileSync(tempFile, `${decorated}\n`, 'utf8');
-    const editor = String(process.env.LEION_TUI_EDITOR || process.env.VISUAL || process.env.EDITOR || 'vi').trim();
-    const quotedPath = tempFile.replace(/'/g, "'\\''");
-    const command = `${editor} '${quotedPath}'`;
-    const result = cp.spawnSync('/bin/sh', ['-lc', command], {
-        stdio: 'inherit'
-    });
-    if (result.status !== 0) {
-        return { ok: false, error: `Editor exited with status ${String(result.status)}` };
-    }
-    try {
-        const text = fs.readFileSync(tempFile, 'utf8');
-        return { ok: true, text };
-    } catch (error: any) {
-        return { ok: false, error: String(error?.message || error) };
-    } finally {
-        try {
-            fs.unlinkSync(tempFile);
-        } catch {
-            // noop
-        }
-    }
+function ensureIndex(index: number, size: number): number {
+    if (size <= 0) return 0;
+    if (index < 0) return 0;
+    if (index >= size) return size - 1;
+    return index;
 }
 
 export function App(props: AppProps): JSX.Element {
+    const config = useMemo(() => loadTuiConfig(props.workspaceRoot), [props.workspaceRoot]);
+    const useLegacy = props.legacyMode === true || config.ui.version === 'legacy';
+
+    if (useLegacy) {
+        return (
+            <LegacyApp
+                workspaceRoot={props.workspaceRoot}
+                initialRunId={props.initialRunId}
+                initialPipeline={props.initialPipeline}
+            />
+        );
+    }
+
+    return (
+        <ModernApp
+            workspaceRoot={props.workspaceRoot}
+            initialRunId={props.initialRunId}
+            initialPipeline={props.initialPipeline}
+            config={config}
+        />
+    );
+}
+
+function ModernApp(props: ModernAppProps): JSX.Element {
     const { exit } = useApp();
-    const [tab, setTab] = useState<TabId>('run');
-    const [statusLine, setStatusLine] = useState<string>('Ready');
+    const [ui, dispatch] = useReducer(uiReducer, undefined, createInitialUiState);
     const [runs, setRuns] = useState<any[]>([]);
-    const [selectedRunIndex, setSelectedRunIndex] = useState(0);
-    const [eventLines, setEventLines] = useState<string[]>([]);
-    const [logLines, setLogLines] = useState<string[]>([]);
-    const [eventOffset, setEventOffset] = useState(0);
-    const [logOffset, setLogOffset] = useState(0);
     const [pipelines, setPipelines] = useState<any[]>([]);
-    const [selectedPipelineIndex, setSelectedPipelineIndex] = useState(0);
-    const [historyRows, setHistoryRows] = useState<any[]>([]);
-    const [selectedHistoryIndex, setSelectedHistoryIndex] = useState(0);
-    const [triggerRows, setTriggerRows] = useState<any[]>([]);
-    const [selectedTriggerIndex, setSelectedTriggerIndex] = useState(0);
-    const [approvals, setApprovals] = useState<any[]>([]);
-    const [selectedApprovalIndex, setSelectedApprovalIndex] = useState(0);
     const [editorNodes, setEditorNodes] = useState<any[]>([]);
-    const [selectedEditorNodeIndex, setSelectedEditorNodeIndex] = useState(0);
+    const [historyRows, setHistoryRows] = useState<any[]>([]);
+    const [triggerRows, setTriggerRows] = useState<any[]>([]);
+    const [approvals, setApprovals] = useState<any[]>([]);
     const [diffLines, setDiffLines] = useState<string[]>([]);
     const [diffSource, setDiffSource] = useState<'audit' | 'git' | 'none'>('none');
-    const [promptTitle, setPromptTitle] = useState<string>('');
-    const [promptValue, setPromptValue] = useState<string>('');
-    const [promptOpen, setPromptOpen] = useState(false);
+    const [eventLines, setEventLines] = useState<string[]>([]);
+    const [logLines, setLogLines] = useState<string[]>([]);
+
     const promptSubmitRef = useRef<((value: string) => void) | null>(null);
-    const config = useMemo(() => loadTuiConfig(props.workspaceRoot), [props.workspaceRoot]);
+    const confirmHandlerRef = useRef<Record<string, (() => void) | undefined>>({});
+    const selectedRunCursorRef = useRef<number>(0);
+    const selectedRunIdRef = useRef<string>('');
+    const pollRef = useRef<Record<string, number>>({});
+    const initialRunAppliedRef = useRef<boolean>(false);
+    const initialPipelineAppliedRef = useRef<boolean>(false);
+
+    const theme = useMemo(() => createTheme(props.config.theme.highContrast), [props.config.theme.highContrast]);
+
     const runtime = useMemo(() => {
         return new core.CoreRuntime({
             workspaceRoot: props.workspaceRoot,
@@ -259,124 +123,151 @@ export function App(props: AppProps): JSX.Element {
     const approvalService = useMemo(() => new core.ApprovalInboxService(runtime, true), [runtime]);
     const diffService = useMemo(() => new core.DiffService(runtime), [runtime]);
     const dslService = useMemo(() => new core.DslMutationService(props.workspaceRoot), [props.workspaceRoot]);
-    const selectedRunCursorRef = useRef<number>(0);
-    const selectedRunIdRef = useRef<string>('');
 
-    const openPrompt = useCallback((title: string, initialValue: string, onSubmit: (value: string) => void) => {
-        setPromptTitle(title);
-        setPromptValue(initialValue);
-        promptSubmitRef.current = onSubmit;
-        setPromptOpen(true);
+    const selectedRun = runs[ui.selectedRunIndex];
+    const selectedRunId = String(selectedRun?.detachedRunId || selectedRun?.pipelineRunId || '').trim();
+    const selectedPipeline = pipelines[ui.selectedPipelineIndex];
+    const selectedEditorNode = editorNodes[ui.selectedEditorNodeIndex];
+    const selectedHistory = historyRows[ui.selectedHistoryIndex];
+    const selectedTrigger = triggerRows[ui.selectedTriggerIndex];
+    const selectedApproval = approvals[ui.selectedApprovalIndex];
+
+    const visibleEvents = useMemo(() => tailWindow(eventLines, 22, ui.eventOffset), [eventLines, ui.eventOffset]);
+    const visibleLogs = useMemo(() => tailWindow(logLines, 12, ui.logOffset), [logLines, ui.logOffset]);
+
+    const yamlPreview = useMemo(() => {
+        if (!selectedEditorNode) return [];
+        try {
+            return buildActionNodeYaml(selectedEditorNode).split('\n');
+        } catch {
+            return [];
+        }
+    }, [selectedEditorNode]);
+
+    const setStatus = useCallback((text: string, tone: 'ok' | 'warn' | 'err' | 'info' | 'muted' = 'info') => {
+        dispatch({ type: 'set_status', text, tone });
     }, []);
 
-    const selectedRun = runs[selectedRunIndex];
-    const selectedRunId = String(selectedRun?.detachedRunId || selectedRun?.pipelineRunId || '').trim();
-    const selectedPipeline = pipelines[selectedPipelineIndex];
-    const selectedEditorNode = editorNodes[selectedEditorNodeIndex];
+    const openPrompt = useCallback((title: string, initialValue: string, onSubmit: (value: string) => void, description?: string) => {
+        promptSubmitRef.current = onSubmit;
+        dispatch({ type: 'open_prompt', title, value: initialValue, description });
+    }, []);
+
+    const openConfirm = useCallback((title: string, body: string, onConfirm: () => void) => {
+        const actionKey = `confirm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        confirmHandlerRef.current[actionKey] = onConfirm;
+        dispatch({ type: 'open_confirm', title, body, actionKey });
+    }, []);
 
     const refreshRuns = useCallback(() => {
         try {
             const rows = supervisor.list_runs();
             setRuns(rows);
+
             if (rows.length === 0) {
-                setSelectedRunIndex(0);
+                dispatch({ type: 'select_index', key: 'run', index: 0, max: 0 });
                 return;
             }
-            if (props.initialRunId) {
-                const idx = rows.findIndex((entry: any) => {
-                    return (
-                        String(entry?.detachedRunId || '') === props.initialRunId
-                        || String(entry?.pipelineRunId || '') === props.initialRunId
-                    );
+
+            if (!initialRunAppliedRef.current && props.initialRunId) {
+                const index = rows.findIndex((entry: any) => {
+                    return String(entry?.detachedRunId || '') === props.initialRunId
+                        || String(entry?.pipelineRunId || '') === props.initialRunId;
                 });
-                if (idx >= 0) setSelectedRunIndex(idx);
-            } else if (selectedRunIndex >= rows.length) {
-                setSelectedRunIndex(rows.length - 1);
+                if (index >= 0) {
+                    dispatch({ type: 'select_index', key: 'run', index, max: rows.length });
+                    initialRunAppliedRef.current = true;
+                    return;
+                }
+                initialRunAppliedRef.current = true;
             }
+
+            dispatch({ type: 'select_index', key: 'run', index: ui.selectedRunIndex, max: rows.length });
         } catch (error: any) {
-            setStatusLine(`Runs refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh runs échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [props.initialRunId, selectedRunIndex, supervisor]);
+    }, [props.initialRunId, setStatus, supervisor, ui.selectedRunIndex]);
 
     const refreshPipelines = useCallback(() => {
         try {
             const rows = catalog.list();
             setPipelines(rows);
-            if (!rows.length) return;
-            if (props.initialPipeline) {
-                const idx = rows.findIndex((entry: any) => {
-                    return (
-                        String(entry?.name || '') === props.initialPipeline
-                        || String(entry?.path || '') === props.initialPipeline
-                    );
-                });
-                if (idx >= 0) setSelectedPipelineIndex(idx);
-            } else if (selectedPipelineIndex >= rows.length) {
-                setSelectedPipelineIndex(rows.length - 1);
+
+            if (rows.length === 0) {
+                dispatch({ type: 'select_index', key: 'pipeline', index: 0, max: 0 });
+                return;
             }
+
+            if (!initialPipelineAppliedRef.current && props.initialPipeline) {
+                const index = rows.findIndex((entry: any) => {
+                    return String(entry?.name || '') === props.initialPipeline
+                        || String(entry?.path || '') === props.initialPipeline;
+                });
+                if (index >= 0) {
+                    dispatch({ type: 'select_index', key: 'pipeline', index, max: rows.length });
+                    initialPipelineAppliedRef.current = true;
+                    return;
+                }
+                initialPipelineAppliedRef.current = true;
+            }
+
+            dispatch({ type: 'select_index', key: 'pipeline', index: ui.selectedPipelineIndex, max: rows.length });
         } catch (error: any) {
-            setStatusLine(`Pipelines refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh pipelines échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [catalog, props.initialPipeline, selectedPipelineIndex]);
+    }, [catalog, props.initialPipeline, setStatus, ui.selectedPipelineIndex]);
+
+    const refreshEditorNodes = useCallback(() => {
+        const pipelinePath = String(pipelines[ui.selectedPipelineIndex]?.path || '').trim();
+        if (!pipelinePath) {
+            setEditorNodes([]);
+            dispatch({ type: 'select_index', key: 'editor', index: 0, max: 0 });
+            return;
+        }
+
+        try {
+            const pipeline = catalog.load(pipelinePath);
+            const steps = Array.isArray(pipeline?.steps) ? pipeline.steps : [];
+            setEditorNodes(steps);
+            dispatch({ type: 'select_index', key: 'editor', index: ui.selectedEditorNodeIndex, max: steps.length });
+        } catch (error: any) {
+            setStatus(`Refresh editor échoué: ${String(error?.message || error)}`, 'err');
+        }
+    }, [catalog, pipelines, setStatus, ui.selectedEditorNodeIndex, ui.selectedPipelineIndex]);
 
     const refreshHistory = useCallback(async () => {
         try {
             const rows = await historyService.list();
-            setHistoryRows(Array.isArray(rows) ? rows : []);
-            if (selectedHistoryIndex >= rows.length && rows.length > 0) {
-                setSelectedHistoryIndex(rows.length - 1);
-            }
+            const safeRows = Array.isArray(rows) ? rows : [];
+            setHistoryRows(safeRows);
+            dispatch({ type: 'select_index', key: 'history', index: ui.selectedHistoryIndex, max: safeRows.length });
         } catch (error: any) {
-            setStatusLine(`History refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh history échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [historyService, selectedHistoryIndex]);
+    }, [historyService, setStatus, ui.selectedHistoryIndex]);
 
     const refreshTriggers = useCallback(() => {
         try {
             const rows = triggerService.list();
             setTriggerRows(rows);
-            if (selectedTriggerIndex >= rows.length && rows.length > 0) {
-                setSelectedTriggerIndex(rows.length - 1);
-            }
+            dispatch({ type: 'select_index', key: 'trigger', index: ui.selectedTriggerIndex, max: rows.length });
         } catch (error: any) {
-            setStatusLine(`Triggers refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh triggers échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [selectedTriggerIndex, triggerService]);
+    }, [setStatus, triggerService, ui.selectedTriggerIndex]);
 
     const refreshApprovals = useCallback(() => {
         try {
             const rows = approvalService.list_pending();
             setApprovals(rows);
-            if (selectedApprovalIndex >= rows.length && rows.length > 0) {
-                setSelectedApprovalIndex(rows.length - 1);
-            }
+            dispatch({ type: 'select_index', key: 'approval', index: ui.selectedApprovalIndex, max: rows.length });
         } catch (error: any) {
-            setStatusLine(`Approvals refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh HITL échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [approvalService, selectedApprovalIndex]);
-
-    const refreshEditorNodes = useCallback(() => {
-        const selectedPipeline = pipelines[selectedPipelineIndex];
-        if (!selectedPipeline?.path) {
-            setEditorNodes([]);
-            setSelectedEditorNodeIndex(0);
-            return;
-        }
-        try {
-            const pipeline = catalog.load(String(selectedPipeline.path));
-            const steps = Array.isArray(pipeline?.steps) ? pipeline.steps : [];
-            setEditorNodes(steps);
-            if (selectedEditorNodeIndex >= steps.length && steps.length > 0) {
-                setSelectedEditorNodeIndex(steps.length - 1);
-            }
-        } catch (error: any) {
-            setStatusLine(`Editor load failed: ${String(error?.message || error)}`);
-        }
-    }, [catalog, pipelines, selectedEditorNodeIndex, selectedPipelineIndex]);
+    }, [approvalService, setStatus, ui.selectedApprovalIndex]);
 
     const refreshDiff = useCallback(async () => {
-        const row = historyRows[selectedHistoryIndex];
-        const runId = String(row?.id || '').trim();
+        const runId = String(historyRows[ui.selectedHistoryIndex]?.id || '').trim();
         if (!runId) {
             setDiffSource('none');
             setDiffLines([]);
@@ -387,119 +278,197 @@ export function App(props: AppProps): JSX.Element {
             setDiffSource(result.source);
             setDiffLines(Array.isArray(result.lines) ? result.lines : []);
         } catch (error: any) {
-            setStatusLine(`Diff refresh failed: ${String(error?.message || error)}`);
+            setStatus(`Refresh diff échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [diffService, historyRows, selectedHistoryIndex]);
+    }, [diffService, historyRows, setStatus, ui.selectedHistoryIndex]);
+
+    const tailSelectedRun = useCallback(() => {
+        if (!selectedRunId) return;
+        try {
+            const tail = supervisor.tail_events(selectedRunId, selectedRunCursorRef.current);
+            selectedRunCursorRef.current = tail.nextCursor;
+            if (!Array.isArray(tail.events) || tail.events.length === 0) {
+                return;
+            }
+            const nextEventLines = tail.events.map((event: any) => formatEventLine(event));
+            const nextLogLines = tail.events
+                .map((event: any) => tryExtractLogLine(event))
+                .filter((entry: string | undefined): entry is string => Boolean(entry));
+
+            setEventLines((previous) => boundedAppend(previous, nextEventLines, props.config.maxEvents));
+            if (nextLogLines.length > 0) {
+                setLogLines((previous) => boundedAppend(previous, nextLogLines, props.config.maxLogs));
+            }
+        } catch {
+            // ignore short race conditions during run lifecycle
+        }
+    }, [props.config.maxEvents, props.config.maxLogs, selectedRunId, supervisor]);
 
     const replaceSelectedNodeFromYaml = useCallback((yamlPayload: string) => {
-        const pipelinePath = String(selectedPipeline?.path || '').trim();
+        const pipelinePath = String(pipelines[ui.selectedPipelineIndex]?.path || '').trim();
         if (!pipelinePath) {
-            setStatusLine('No selected pipeline for editor action.');
+            setStatus('Aucun pipeline sélectionné pour cette action.', 'warn');
             return;
         }
         try {
             dslService.replace_node(pipelinePath, yamlPayload);
             refreshEditorNodes();
             refreshPipelines();
-            setStatusLine('Node updated.');
+            setStatus('Node mis à jour.', 'ok');
         } catch (error: any) {
-            setStatusLine(`Replace failed: ${String(error?.message || error)}`);
+            setStatus(`Replace node échoué: ${String(error?.message || error)}`, 'err');
         }
-    }, [dslService, refreshEditorNodes, refreshPipelines, selectedPipeline?.path]);
+    }, [dslService, pipelines, refreshEditorNodes, refreshPipelines, setStatus, ui.selectedPipelineIndex]);
 
     const patchSelectedNode = useCallback((patch: { intent?: string; description?: string; onFailure?: string; payload?: any }) => {
         if (!selectedEditorNode) {
-            setStatusLine('No selected node.');
+            setStatus('Aucun node sélectionné.', 'warn');
             return;
         }
         const yamlPayload = buildActionNodeYaml(selectedEditorNode, patch);
         replaceSelectedNodeFromYaml(yamlPayload);
-    }, [replaceSelectedNodeFromYaml, selectedEditorNode]);
+    }, [replaceSelectedNodeFromYaml, selectedEditorNode, setStatus]);
+
+    const startDetachedPipeline = useCallback((entry: any) => {
+        try {
+            const out = supervisor.start_detached({
+                pipeline: String(entry?.path || entry?.name || ''),
+                dryRun: false
+            });
+            setStatus(`Run detached démarré: ${String(out?.run_id || '-')}`, 'ok');
+            refreshRuns();
+        } catch (error: any) {
+            setStatus(`Run detached échoué: ${String(error?.message || error)}`, 'err');
+        }
+    }, [refreshRuns, setStatus, supervisor]);
+
+    const executePaletteAction = useCallback((item: CommandPaletteItem) => {
+        if (item.id === 'action:refresh') {
+            refreshRuns();
+            refreshPipelines();
+            refreshEditorNodes();
+            void refreshHistory();
+            refreshTriggers();
+            refreshApprovals();
+            void refreshDiff();
+            setStatus('Refresh global exécuté.', 'ok');
+            return;
+        }
+        if (item.id === 'action:theme-toggle') {
+            setStatus('Mode high-contrast se configure via intentRouter.tui.theme.highContrast.', 'info');
+            return;
+        }
+        if (item.id === 'action:legacy') {
+            setStatus('Relance: leion-roots tui --legacy', 'info');
+            return;
+        }
+
+        dispatch(item.event);
+        if (item.followUpEvent) {
+            dispatch(item.followUpEvent);
+        }
+    }, [refreshApprovals, refreshDiff, refreshEditorNodes, refreshPipelines, refreshRuns, refreshTriggers, refreshHistory, setStatus]);
+
+    const moveByFocus = useCallback((delta: number) => {
+        if (ui.activeTab === 'run') {
+            if (ui.focusZone === 'left') {
+                dispatch({ type: 'move_index', key: 'run', delta, max: runs.length });
+                return;
+            }
+            if (ui.focusZone === 'center') {
+                dispatch({ type: 'scroll_events', delta: -delta * 5 });
+                return;
+            }
+            if (ui.focusZone === 'right') {
+                dispatch({ type: 'scroll_logs', delta: -delta * 5 });
+                return;
+            }
+            return;
+        }
+
+        if (ui.activeTab === 'pipelines') {
+            dispatch({ type: 'move_index', key: 'pipeline', delta, max: pipelines.length });
+            return;
+        }
+
+        if (ui.activeTab === 'editor') {
+            dispatch({ type: 'move_index', key: 'editor', delta, max: editorNodes.length });
+            return;
+        }
+
+        if (ui.activeTab === 'history') {
+            dispatch({ type: 'move_index', key: 'history', delta, max: historyRows.length });
+            return;
+        }
+
+        if (ui.activeTab === 'triggers') {
+            dispatch({ type: 'move_index', key: 'trigger', delta, max: triggerRows.length });
+            return;
+        }
+
+        if (ui.activeTab === 'hitl') {
+            dispatch({ type: 'move_index', key: 'approval', delta, max: approvals.length });
+        }
+    }, [approvals.length, editorNodes.length, historyRows.length, pipelines.length, runs.length, triggerRows.length, ui.activeTab, ui.focusZone]);
 
     useEffect(() => {
         refreshRuns();
         refreshPipelines();
+        refreshEditorNodes();
         void refreshHistory();
         refreshTriggers();
         refreshApprovals();
-    }, [refreshApprovals, refreshHistory, refreshPipelines, refreshRuns, refreshTriggers]);
-
-    useEffect(() => {
-        refreshEditorNodes();
-    }, [refreshEditorNodes]);
-
-    useEffect(() => {
         void refreshDiff();
-    }, [refreshDiff]);
+        // Intentionally bootstrap once; periodic scheduler handles subsequent refresh cycles.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     useEffect(() => {
-        const timer = setInterval(refreshRuns, 1000);
-        return () => clearInterval(timer);
-    }, [refreshRuns]);
-
-    useEffect(() => {
-        const timer = setInterval(refreshPipelines, 2000);
-        return () => clearInterval(timer);
-    }, [refreshPipelines]);
-
-    useEffect(() => {
-        const timer = setInterval(refreshEditorNodes, 2500);
-        return () => clearInterval(timer);
-    }, [refreshEditorNodes]);
-
-    useEffect(() => {
-        const timer = setInterval(() => void refreshHistory(), 2500);
-        return () => clearInterval(timer);
-    }, [refreshHistory]);
-
-    useEffect(() => {
-        const timer = setInterval(() => void refreshDiff(), 2500);
-        return () => clearInterval(timer);
-    }, [refreshDiff]);
-
-    useEffect(() => {
-        const timer = setInterval(refreshTriggers, 2500);
-        return () => clearInterval(timer);
-    }, [refreshTriggers]);
-
-    useEffect(() => {
-        const timer = setInterval(refreshApprovals, 1500);
-        return () => clearInterval(timer);
-    }, [refreshApprovals]);
-
-    useEffect(() => {
-        const previous = selectedRunIdRef.current;
-        if (selectedRunId && previous !== selectedRunId) {
-            selectedRunCursorRef.current = 0;
+        if (selectedRunId && selectedRunIdRef.current !== selectedRunId) {
             selectedRunIdRef.current = selectedRunId;
+            selectedRunCursorRef.current = 0;
             setEventLines([]);
             setLogLines([]);
-            setEventOffset(0);
-            setLogOffset(0);
+            dispatch({ type: 'scroll_events', delta: -999999 });
+            dispatch({ type: 'scroll_logs', delta: -999999 });
         }
     }, [selectedRunId]);
 
     useEffect(() => {
-        if (!selectedRunId) return;
         const timer = setInterval(() => {
-            try {
-                const tail = supervisor.tail_events(selectedRunId, selectedRunCursorRef.current);
-                selectedRunCursorRef.current = tail.nextCursor;
-                if (!Array.isArray(tail.events) || tail.events.length === 0) return;
-                const nextEventLines = tail.events.map((event: any) => formatEventLine(event));
-                const nextLogLines = tail.events
-                    .map((event: any) => tryExtractLogLine(event))
-                    .filter((entry: string | undefined): entry is string => Boolean(entry));
-                setEventLines((prev) => boundedAppend(prev, nextEventLines, config.maxEvents));
-                if (nextLogLines.length > 0) {
-                    setLogLines((prev) => boundedAppend(prev, nextLogLines, config.maxLogs));
+            const now = Date.now();
+            const active = ui.activeTab;
+
+            const every = (key: string, ms: number, fn: () => void) => {
+                const last = pollRef.current[key] || 0;
+                if (now - last >= ms) {
+                    pollRef.current[key] = now;
+                    fn();
                 }
-            } catch {
-                // ignore short race conditions during run file creation
-            }
-        }, 450);
+            };
+
+            every('runs', active === 'run' ? 700 : 1400, refreshRuns);
+            every('pipelines', active === 'pipelines' || active === 'editor' ? 900 : 2000, refreshPipelines);
+            every('editor', active === 'editor' ? 900 : 2500, refreshEditorNodes);
+            every('history', active === 'history' || active === 'diff' ? 1300 : 2600, () => void refreshHistory());
+            every('diff', active === 'diff' ? 1100 : 2600, () => void refreshDiff());
+            every('triggers', active === 'triggers' ? 1200 : 2500, refreshTriggers);
+            every('hitl', active === 'hitl' ? 1000 : 2200, refreshApprovals);
+            every('events', active === 'run' ? 250 : 700, tailSelectedRun);
+        }, 200);
+
         return () => clearInterval(timer);
-    }, [config.maxEvents, config.maxLogs, selectedRunId, supervisor]);
+    }, [
+        refreshApprovals,
+        refreshDiff,
+        refreshEditorNodes,
+        refreshHistory,
+        refreshPipelines,
+        refreshRuns,
+        refreshTriggers,
+        tailSelectedRun,
+        ui.activeTab
+    ]);
 
     useEffect(() => {
         return () => {
@@ -508,131 +477,201 @@ export function App(props: AppProps): JSX.Element {
         };
     }, [approvalService, runtime]);
 
-    useInput((input, key) => {
-        if (promptOpen) {
-            if (key.escape) {
-                setPromptOpen(false);
-                promptSubmitRef.current = null;
-                setStatusLine('Prompt cancelled');
-                return;
+    const paletteItems = useMemo(() => {
+        const items: CommandPaletteItem[] = [
+            {
+                id: 'action:refresh',
+                label: 'Refresh global data',
+                hint: 'action',
+                category: 'action',
+                keywords: ['refresh', 'reload', 'sync'],
+                event: { type: 'set_status', text: 'Refresh en cours...', tone: 'info' }
+            },
+            {
+                id: 'action:legacy',
+                label: 'Afficher fallback legacy',
+                hint: 'action',
+                category: 'action',
+                keywords: ['legacy', 'fallback', 'rollback'],
+                event: { type: 'set_status', text: 'Legacy mode info', tone: 'info' }
+            },
+            {
+                id: 'action:theme-toggle',
+                label: 'Info mode high-contrast',
+                hint: 'action',
+                category: 'action',
+                keywords: ['contrast', 'theme', 'accessibility'],
+                event: { type: 'set_status', text: 'Theme info', tone: 'info' }
             }
-            if (key.return) {
-                const submit = promptSubmitRef.current;
-                setPromptOpen(false);
-                promptSubmitRef.current = null;
-                if (submit) {
-                    submit(promptValue);
-                }
-                return;
-            }
-            if (key.backspace || key.delete) {
-                setPromptValue((prev) => prev.slice(0, -1));
-                return;
-            }
-            if (!key.ctrl && !key.meta && input) {
-                setPromptValue((prev) => `${prev}${input}`);
-            }
-            return;
+        ];
+
+        for (const [key, tab] of Object.entries(TAB_SHORTCUTS)) {
+            items.push({
+                id: `tab:${tab}`,
+                label: `Aller vers ${tab}`,
+                hint: `tab ${key}`,
+                category: 'tab',
+                keywords: [tab, 'tab', key],
+                event: { type: 'switch_tab', tab }
+            });
         }
 
-        if ((key.ctrl && input === 'c') || input === 'q') {
-            exit();
-            return;
-        }
-        if (input === '1') setTab('run');
-        if (input === '2') setTab('pipelines');
-        if (input === '3') setTab('editor');
-        if (input === '4') setTab('history');
-        if (input === '5') setTab('diff');
-        if (input === '6') setTab('triggers');
-        if (input === '7') setTab('hitl');
+        runs.slice(0, 20).forEach((entry, index) => {
+            const runId = String(entry?.detachedRunId || entry?.pipelineRunId || `run_${index}`);
+            items.push({
+                id: `entity:run:${index}`,
+                label: `Run ${runId}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['run', runId, String(entry?.status || '-')],
+                event: { type: 'switch_tab', tab: 'run' },
+                followUpEvent: { type: 'select_index', key: 'run', index, max: runs.length }
+            });
+        });
 
-        if (tab === 'run') {
-            if (key.upArrow && runs.length > 0) {
-                setSelectedRunIndex((prev) => Math.max(0, prev - 1));
+        pipelines.slice(0, 20).forEach((entry, index) => {
+            const label = String(entry?.name || `pipeline_${index}`);
+            items.push({
+                id: `entity:pipeline:${index}`,
+                label: `Pipeline ${label}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['pipeline', label, String(entry?.path || '')],
+                event: { type: 'switch_tab', tab: 'pipelines' },
+                followUpEvent: { type: 'select_index', key: 'pipeline', index, max: pipelines.length }
+            });
+        });
+
+        editorNodes.slice(0, 20).forEach((entry, index) => {
+            const label = String(entry?.id || `node_${index}`);
+            items.push({
+                id: `entity:node:${index}`,
+                label: `Node ${label}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['node', label, String(entry?.intent || '')],
+                event: { type: 'switch_tab', tab: 'editor' },
+                followUpEvent: { type: 'select_index', key: 'editor', index, max: editorNodes.length }
+            });
+        });
+
+        historyRows.slice(0, 20).forEach((entry, index) => {
+            const label = String(entry?.id || `history_${index}`);
+            items.push({
+                id: `entity:history:${index}`,
+                label: `History ${label}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['history', label, String(entry?.status || '')],
+                event: { type: 'switch_tab', tab: 'history' },
+                followUpEvent: { type: 'select_index', key: 'history', index, max: historyRows.length }
+            });
+        });
+
+        triggerRows.slice(0, 20).forEach((entry, index) => {
+            const label = String(entry?.id || `trigger_${index}`);
+            items.push({
+                id: `entity:trigger:${index}`,
+                label: `Trigger ${label}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['trigger', label, String(entry?.pipelineName || '')],
+                event: { type: 'switch_tab', tab: 'triggers' },
+                followUpEvent: { type: 'select_index', key: 'trigger', index, max: triggerRows.length }
+            });
+        });
+
+        approvals.slice(0, 20).forEach((entry, index) => {
+            const label = String(entry?.id || `approval_${index}`);
+            items.push({
+                id: `entity:approval:${index}`,
+                label: `Approval ${label}`,
+                hint: 'entity',
+                category: 'entity',
+                keywords: ['hitl', 'approval', label, String(entry?.runId || '')],
+                event: { type: 'switch_tab', tab: 'hitl' },
+                followUpEvent: { type: 'select_index', key: 'approval', index, max: approvals.length }
+            });
+        });
+
+        return items;
+    }, [approvals, editorNodes, historyRows, pipelines, runs, triggerRows]);
+
+    const rankedPaletteItems = useMemo(() => {
+        return rankPaletteItems(paletteItems, ui.palette.query, 30);
+    }, [paletteItems, ui.palette.query]);
+
+    const applyTabAction = useCallback((input: string, key: any) => {
+        if (ui.activeTab === 'run') {
+            if (input === '[') {
+                dispatch({ type: 'scroll_events', delta: 25 });
                 return;
             }
-            if (key.downArrow && runs.length > 0) {
-                setSelectedRunIndex((prev) => Math.min(runs.length - 1, prev + 1));
+            if (input === ']') {
+                dispatch({ type: 'scroll_events', delta: -25 });
                 return;
             }
-            if (input === '[') setEventOffset((prev) => prev + 25);
-            if (input === ']') setEventOffset((prev) => Math.max(0, prev - 25));
-            if (input === '{') setLogOffset((prev) => prev + 25);
-            if (input === '}') setLogOffset((prev) => Math.max(0, prev - 25));
+            if (input === '{') {
+                dispatch({ type: 'scroll_logs', delta: 25 });
+                return;
+            }
+            if (input === '}') {
+                dispatch({ type: 'scroll_logs', delta: -25 });
+                return;
+            }
             if (input === 'l') {
                 refreshRuns();
-                setStatusLine('Runs refreshed');
+                setStatus('Runs refresh demandée.', 'ok');
+                return;
             }
             if (input === 'p' && selectedRunId) {
                 try {
                     supervisor.pause_run(selectedRunId);
-                    setStatusLine(`Pause requested for ${selectedRunId}`);
+                    setStatus(`Pause demandée pour ${selectedRunId}`, 'warn');
                 } catch (error: any) {
-                    setStatusLine(`Pause failed: ${String(error?.message || error)}`);
+                    setStatus(`Pause échouée: ${String(error?.message || error)}`, 'err');
                 }
+                return;
             }
             if (input === 'r' && selectedRunId) {
                 try {
                     supervisor.resume_run(selectedRunId);
-                    setStatusLine(`Resume requested for ${selectedRunId}`);
+                    setStatus(`Resume demandée pour ${selectedRunId}`, 'ok');
                 } catch (error: any) {
-                    setStatusLine(`Resume failed: ${String(error?.message || error)}`);
+                    setStatus(`Resume échouée: ${String(error?.message || error)}`, 'err');
                 }
+                return;
             }
             if (input === 'c' && selectedRunId) {
-                try {
-                    supervisor.cancel_run(selectedRunId);
-                    setStatusLine(`Cancel requested for ${selectedRunId}`);
-                } catch (error: any) {
-                    setStatusLine(`Cancel failed: ${String(error?.message || error)}`);
-                }
+                openConfirm(
+                    'Confirmer cancel run',
+                    `Annuler définitivement le run ${selectedRunId} ?`,
+                    () => {
+                        try {
+                            supervisor.cancel_run(selectedRunId);
+                            setStatus(`Cancel demandé pour ${selectedRunId}`, 'warn');
+                        } catch (error: any) {
+                            setStatus(`Cancel échoué: ${String(error?.message || error)}`, 'err');
+                        }
+                    }
+                );
             }
             return;
         }
 
-        if (tab === 'pipelines') {
-            const startDetached = (entry: any) => {
-                try {
-                    const out = supervisor.start_detached({
-                        pipeline: String(entry?.path || entry?.name || ''),
-                        dryRun: false
-                    });
-                    setStatusLine(`Detached run started: ${String(out?.run_id || '')}`);
-                    refreshRuns();
-                } catch (error: any) {
-                    setStatusLine(`Run failed: ${String(error?.message || error)}`);
-                }
-            };
-            if (key.upArrow && pipelines.length > 0) {
-                setSelectedPipelineIndex((prev) => Math.max(0, prev - 1));
+        if (ui.activeTab === 'pipelines') {
+            const selected = pipelines[ui.selectedPipelineIndex];
+            if ((key.return || input === 'r') && selected) {
+                startDetachedPipeline(selected);
                 return;
             }
-            if (key.downArrow && pipelines.length > 0) {
-                setSelectedPipelineIndex((prev) => Math.min(pipelines.length - 1, prev + 1));
-                return;
-            }
-            if (key.return && pipelines.length > 0) {
-                const entry = pipelines[selectedPipelineIndex];
-                if (!entry) return;
-                startDetached(entry);
-                return;
-            }
-            if (input === 'r' && pipelines.length > 0) {
-                const entry = pipelines[selectedPipelineIndex];
-                if (!entry) return;
-                startDetached(entry);
-                return;
-            }
-            if (input === 'd' && pipelines.length > 0) {
-                const entry = pipelines[selectedPipelineIndex];
-                if (!entry) return;
-                void runtime.run_pipeline_file(String(entry.path || ''), { dryRun: true })
+            if (input === 'd' && selected) {
+                void runtime.run_pipeline_file(String(selected.path || ''), { dryRun: true })
                     .then((result: any) => {
-                        setStatusLine(`Dry-run ${result?.success ? 'ok' : 'failed'} (${String(result?.runId || '-')})`);
+                        setStatus(`Dry-run ${result?.success ? 'ok' : 'failed'} (${String(result?.runId || '-')})`, result?.success ? 'ok' : 'warn');
                     })
                     .catch((error: any) => {
-                        setStatusLine(`Dry-run failed: ${String(error?.message || error)}`);
+                        setStatus(`Dry-run échoué: ${String(error?.message || error)}`, 'err');
                     });
                 return;
             }
@@ -641,156 +680,166 @@ export function App(props: AppProps): JSX.Element {
                 try {
                     catalog.create(name);
                     refreshPipelines();
-                    setStatusLine(`Pipeline created: ${name}`);
+                    setStatus(`Pipeline créé: ${name}`, 'ok');
                 } catch (error: any) {
-                    setStatusLine(`Create failed: ${String(error?.message || error)}`);
+                    setStatus(`Création échouée: ${String(error?.message || error)}`, 'err');
                 }
                 return;
             }
-            if (input === 'x' && pipelines.length > 0) {
-                const entry = pipelines[selectedPipelineIndex];
-                if (!entry) return;
-                try {
-                    catalog.delete(String(entry.path || entry.name || ''));
-                    refreshPipelines();
-                    refreshEditorNodes();
-                    setStatusLine(`Pipeline deleted: ${String(entry.name || '-')}`);
-                } catch (error: any) {
-                    setStatusLine(`Delete failed: ${String(error?.message || error)}`);
-                }
+            if (input === 'x' && selected) {
+                openConfirm(
+                    'Confirmer suppression pipeline',
+                    `Supprimer ${String(selected?.name || selected?.path || '?')} ?`,
+                    () => {
+                        try {
+                            catalog.delete(String(selected.path || selected.name || ''));
+                            refreshPipelines();
+                            refreshEditorNodes();
+                            setStatus(`Pipeline supprimé: ${String(selected?.name || '-')}`, 'warn');
+                        } catch (error: any) {
+                            setStatus(`Suppression échouée: ${String(error?.message || error)}`, 'err');
+                        }
+                    }
+                );
                 return;
             }
             if (input === 'e') {
-                setTab('editor');
-                return;
+                dispatch({ type: 'switch_tab', tab: 'editor' });
+                dispatch({ type: 'set_focus', zone: defaultFocusForTab('editor') });
             }
             return;
         }
 
-        if (tab === 'editor') {
-            if (key.upArrow && editorNodes.length > 0) {
-                setSelectedEditorNodeIndex((prev) => Math.max(0, prev - 1));
-                return;
-            }
-            if (key.downArrow && editorNodes.length > 0) {
-                setSelectedEditorNodeIndex((prev) => Math.min(editorNodes.length - 1, prev + 1));
-                return;
-            }
-            if (!selectedPipeline?.path) {
-                return;
-            }
+        if (ui.activeTab === 'editor') {
+            const pipelinePath = String(pipelines[ui.selectedPipelineIndex]?.path || '').trim();
+            if (!pipelinePath) return;
+
             if (input === 'u' && editorNodes.length > 1) {
                 const ids = editorNodes.map((entry: any) => String(entry?.id || '').trim()).filter(Boolean);
-                const idx = selectedEditorNodeIndex;
-                if (idx > 0) {
-                    [ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]];
+                const index = ui.selectedEditorNodeIndex;
+                if (index > 0) {
+                    [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
                     try {
-                        dslService.reorder_nodes(String(selectedPipeline.path), ids);
-                        setSelectedEditorNodeIndex(idx - 1);
+                        dslService.reorder_nodes(pipelinePath, ids);
+                        dispatch({ type: 'select_index', key: 'editor', index: index - 1, max: ids.length });
                         refreshEditorNodes();
                         refreshPipelines();
-                        setStatusLine('Node moved up');
+                        setStatus('Node déplacé vers le haut.', 'ok');
                     } catch (error: any) {
-                        setStatusLine(`Reorder failed: ${String(error?.message || error)}`);
+                        setStatus(`Reorder échoué: ${String(error?.message || error)}`, 'err');
                     }
                 }
                 return;
             }
-            if (input === 'j' && editorNodes.length > 1) {
+
+            if (input === 'j' && editorNodes.length > 1 && ui.focusZone !== 'left') {
+                // j reste disponible en mode hybrid pour move list; on réserve ici j-reorder seulement hors focus liste
                 const ids = editorNodes.map((entry: any) => String(entry?.id || '').trim()).filter(Boolean);
-                const idx = selectedEditorNodeIndex;
-                if (idx < ids.length - 1) {
-                    [ids[idx], ids[idx + 1]] = [ids[idx + 1], ids[idx]];
+                const index = ui.selectedEditorNodeIndex;
+                if (index < ids.length - 1) {
+                    [ids[index], ids[index + 1]] = [ids[index + 1], ids[index]];
                     try {
-                        dslService.reorder_nodes(String(selectedPipeline.path), ids);
-                        setSelectedEditorNodeIndex(idx + 1);
+                        dslService.reorder_nodes(pipelinePath, ids);
+                        dispatch({ type: 'select_index', key: 'editor', index: index + 1, max: ids.length });
                         refreshEditorNodes();
                         refreshPipelines();
-                        setStatusLine('Node moved down');
+                        setStatus('Node déplacé vers le bas.', 'ok');
                     } catch (error: any) {
-                        setStatusLine(`Reorder failed: ${String(error?.message || error)}`);
+                        setStatus(`Reorder échoué: ${String(error?.message || error)}`, 'err');
                     }
                 }
                 return;
             }
-            if (input === 'x' && editorNodes.length > 0) {
-                const node = editorNodes[selectedEditorNodeIndex];
-                const nodeId = String(node?.id || '').trim();
+
+            if (input === 'x' && selectedEditorNode) {
+                const nodeId = String(selectedEditorNode?.id || '').trim();
                 if (!nodeId) return;
-                try {
-                    dslService.delete_node(String(selectedPipeline.path), nodeId);
-                    setStatusLine(`Node deleted: ${nodeId}`);
-                    refreshEditorNodes();
-                    refreshPipelines();
-                } catch (error: any) {
-                    setStatusLine(`Delete failed: ${String(error?.message || error)}`);
-                }
+                openConfirm(
+                    'Confirmer suppression node',
+                    `Supprimer node ${nodeId} ?`,
+                    () => {
+                        try {
+                            dslService.delete_node(pipelinePath, nodeId);
+                            refreshEditorNodes();
+                            refreshPipelines();
+                            setStatus(`Node supprimé: ${nodeId}`, 'warn');
+                        } catch (error: any) {
+                            setStatus(`Suppression node échouée: ${String(error?.message || error)}`, 'err');
+                        }
+                    }
+                );
                 return;
             }
+
             if (input === 'a') {
-                const nextId = `node_${Date.now().toString(36).slice(-6)}`;
-                const yamlPayload = buildAddNodeTemplate(nextId);
-                setStatusLine('Opening YAML editor for new node...');
-                const edited = editTextWithEditor(yamlPayload);
-                if (!edited.ok || !edited.text) {
-                    setStatusLine(edited.error || 'YAML editor aborted');
-                    return;
-                }
-                try {
-                    dslService.add_node(String(selectedPipeline.path), edited.text);
-                    setStatusLine('Node added.');
-                    refreshEditorNodes();
-                    refreshPipelines();
-                } catch (error: any) {
-                    setStatusLine(`Add failed: ${String(error?.message || error)}`);
-                }
+                openPrompt(
+                    `Ajouter node type (${NODE_TEMPLATE_HINT})`,
+                    'action',
+                    (value) => {
+                        const template = normalizeNodeTemplateKey(value);
+                        if (!template) {
+                            setStatus(`Type inconnu: ${value}`, 'warn');
+                            return;
+                        }
+                        const nextId = `${template.replace(/[^a-z0-9]+/g, '_')}_${Date.now().toString(36).slice(-6)}`;
+                        const yamlPayload = buildAddNodeTemplate(template, nextId);
+                        setStatus(`Ouverture template ${template} dans $EDITOR...`, 'info');
+                        const edited = editTextWithEditor(yamlPayload);
+                        if (!edited.ok || !edited.text) {
+                            setStatus(edited.error || 'Édition YAML annulée.', 'warn');
+                            return;
+                        }
+                        try {
+                            dslService.add_node(pipelinePath, edited.text);
+                            refreshEditorNodes();
+                            refreshPipelines();
+                            setStatus(`Node ajouté (${template}).`, 'ok');
+                        } catch (error: any) {
+                            setStatus(`Ajout node échoué: ${String(error?.message || error)}`, 'err');
+                        }
+                    },
+                    'Catalogue: action|script|http|prompt|form|switch|repo|sub_pipeline|loop|agent|team|memory_save|memory_recall|memory_clear'
+                );
                 return;
             }
 
             if (input === 'v') {
                 try {
-                    const pipeline = catalog.load(String(selectedPipeline.path));
+                    const pipeline = catalog.load(pipelinePath);
                     const yamlPayload = buildPipelineYaml(pipeline);
-                    setStatusLine('Opening full pipeline YAML editor...');
                     const edited = editTextWithEditor(yamlPayload);
                     if (!edited.ok || !edited.text) {
-                        setStatusLine(edited.error || 'YAML editor aborted');
+                        setStatus(edited.error || 'Édition YAML pipeline annulée.', 'warn');
                         return;
                     }
-                    dslService.edit_pipeline(String(selectedPipeline.path), edited.text);
+                    dslService.edit_pipeline(pipelinePath, edited.text);
                     refreshEditorNodes();
                     refreshPipelines();
-                    setStatusLine('Pipeline YAML updated.');
+                    setStatus('Pipeline YAML mis à jour.', 'ok');
                 } catch (error: any) {
-                    setStatusLine(`Pipeline YAML edit failed: ${String(error?.message || error)}`);
+                    setStatus(`Édition pipeline échouée: ${String(error?.message || error)}`, 'err');
                 }
                 return;
             }
 
             if (input === 'i' && selectedEditorNode) {
-                openPrompt(
-                    'Set intent',
-                    String(selectedEditorNode.intent || ''),
-                    (value) => patchSelectedNode({ intent: String(value || '').trim() })
-                );
+                openPrompt('Set intent', String(selectedEditorNode.intent || ''), (value) => {
+                    patchSelectedNode({ intent: String(value || '').trim() });
+                }, 'Champ technique: intent EN');
                 return;
             }
 
             if (input === 'm' && selectedEditorNode) {
-                openPrompt(
-                    'Set description (empty clears)',
-                    String(selectedEditorNode.description || ''),
-                    (value) => patchSelectedNode({ description: String(value || '') })
-                );
+                openPrompt('Set description', String(selectedEditorNode.description || ''), (value) => {
+                    patchSelectedNode({ description: String(value || '') });
+                });
                 return;
             }
 
             if (input === 'o' && selectedEditorNode) {
-                openPrompt(
-                    'Set on_failure target (empty clears)',
-                    String(selectedEditorNode.onFailure || ''),
-                    (value) => patchSelectedNode({ onFailure: String(value || '') })
-                );
+                openPrompt('Set on_failure', String(selectedEditorNode.onFailure || ''), (value) => {
+                    patchSelectedNode({ onFailure: String(value || '') });
+                });
                 return;
             }
 
@@ -798,303 +847,366 @@ export function App(props: AppProps): JSX.Element {
                 const payload = selectedEditorNode.payload && typeof selectedEditorNode.payload === 'object'
                     ? selectedEditorNode.payload
                     : {};
-                openPrompt(
-                    'Set payload.command',
-                    String(payload.command || ''),
-                    (value) => patchSelectedNode({ payload: { ...payload, command: String(value || '') } })
-                );
+                openPrompt('Set payload.command', String(payload.command || ''), (value) => {
+                    patchSelectedNode({ payload: { ...payload, command: String(value || '') } });
+                });
                 return;
             }
 
             if (input === 'y' && selectedEditorNode) {
-                const yaml = buildActionNodeYaml(selectedEditorNode);
-                setStatusLine('Opening YAML editor...');
-                const edited = editTextWithEditor(yaml);
+                const yamlPayload = buildActionNodeYaml(selectedEditorNode);
+                const edited = editTextWithEditor(yamlPayload);
                 if (!edited.ok || !edited.text) {
-                    setStatusLine(edited.error || 'YAML editor aborted');
+                    setStatus(edited.error || 'Édition YAML node annulée.', 'warn');
                     return;
                 }
                 replaceSelectedNodeFromYaml(edited.text);
-                return;
             }
             return;
         }
 
-        if (tab === 'history') {
-            if (key.upArrow && historyRows.length > 0) setSelectedHistoryIndex((prev) => Math.max(0, prev - 1));
-            if (key.downArrow && historyRows.length > 0) setSelectedHistoryIndex((prev) => Math.min(historyRows.length - 1, prev + 1));
-            return;
-        }
-
-        if (tab === 'diff') {
+        if (ui.activeTab === 'diff') {
             if (input === 'f') {
                 void refreshDiff();
-                setStatusLine('Diff refreshed');
+                setStatus('Diff refresh demandée.', 'ok');
             }
             return;
         }
 
-        if (tab === 'triggers') {
-            if (key.upArrow && triggerRows.length > 0) setSelectedTriggerIndex((prev) => Math.max(0, prev - 1));
-            if (key.downArrow && triggerRows.length > 0) setSelectedTriggerIndex((prev) => Math.min(triggerRows.length - 1, prev + 1));
+        if (ui.activeTab === 'triggers') {
             if (input === 's') {
                 void triggerService.start()
-                    .then(() => setStatusLine('Triggers started'))
-                    .catch((error: any) => setStatusLine(`Triggers start failed: ${String(error?.message || error)}`));
+                    .then(() => setStatus('Triggers démarrés.', 'ok'))
+                    .catch((error: any) => setStatus(`Start triggers échoué: ${String(error?.message || error)}`, 'err'));
+                return;
             }
             if (input === 'x') {
                 void triggerService.stop()
-                    .then(() => setStatusLine('Triggers stopped'))
-                    .catch((error: any) => setStatusLine(`Triggers stop failed: ${String(error?.message || error)}`));
+                    .then(() => setStatus('Triggers stoppés.', 'warn'))
+                    .catch((error: any) => setStatus(`Stop triggers échoué: ${String(error?.message || error)}`, 'err'));
+                return;
             }
             if (input === 'f') {
                 void triggerService.refresh()
                     .then(() => {
                         refreshTriggers();
-                        setStatusLine('Triggers refreshed');
+                        setStatus('Triggers refresh exécuté.', 'ok');
                     })
-                    .catch((error: any) => setStatusLine(`Triggers refresh failed: ${String(error?.message || error)}`));
+                    .catch((error: any) => setStatus(`Refresh triggers échoué: ${String(error?.message || error)}`, 'err'));
             }
             return;
         }
 
-        if (tab === 'hitl') {
-            if (key.upArrow && approvals.length > 0) setSelectedApprovalIndex((prev) => Math.max(0, prev - 1));
-            if (key.downArrow && approvals.length > 0) setSelectedApprovalIndex((prev) => Math.min(approvals.length - 1, prev + 1));
-            const selected = approvals[selectedApprovalIndex];
-            if (!selected) return;
+        if (ui.activeTab === 'hitl') {
+            if (!selectedApproval) return;
             if (input === 'a') {
                 try {
-                    approvalService.resolve({ pendingId: selected.id, decision: 'approve' });
-                    setStatusLine(`Approved ${String(selected.id)}`);
+                    approvalService.resolve({ pendingId: selectedApproval.id, decision: 'approve' });
                     refreshApprovals();
+                    setStatus(`Approval accepté: ${String(selectedApproval.id)}`, 'ok');
                 } catch (error: any) {
-                    setStatusLine(`Approve failed: ${String(error?.message || error)}`);
+                    setStatus(`Approve échoué: ${String(error?.message || error)}`, 'err');
                 }
+                return;
             }
             if (input === 'r') {
-                try {
-                    approvalService.resolve({ pendingId: selected.id, decision: 'reject' });
-                    setStatusLine(`Rejected ${String(selected.id)}`);
-                    refreshApprovals();
-                } catch (error: any) {
-                    setStatusLine(`Reject failed: ${String(error?.message || error)}`);
-                }
+                openConfirm(
+                    'Confirmer reject approval',
+                    `Reject ${String(selectedApproval.id)} ?`,
+                    () => {
+                        try {
+                            approvalService.resolve({ pendingId: selectedApproval.id, decision: 'reject' });
+                            refreshApprovals();
+                            setStatus(`Approval rejeté: ${String(selectedApproval.id)}`, 'warn');
+                        } catch (error: any) {
+                            setStatus(`Reject échoué: ${String(error?.message || error)}`, 'err');
+                        }
+                    }
+                );
             }
         }
+    }, [
+        approvalService,
+        catalog,
+        dslService,
+        editorNodes,
+        openConfirm,
+        openPrompt,
+        patchSelectedNode,
+        pipelines,
+        refreshApprovals,
+        refreshDiff,
+        refreshEditorNodes,
+        refreshPipelines,
+        refreshRuns,
+        refreshTriggers,
+        replaceSelectedNodeFromYaml,
+        runtime,
+        selectedApproval,
+        selectedEditorNode,
+        selectedRunId,
+        setStatus,
+        startDetachedPipeline,
+        supervisor,
+        triggerService,
+        ui.activeTab,
+        ui.focusZone,
+        ui.selectedEditorNodeIndex,
+        ui.selectedPipelineIndex
+    ]);
+
+    useInput((input, key) => {
+        if (ui.confirm.open) {
+            const action = resolveGlobalKeyAction(input, key, props.config.keymap.profile, props.config.palette.enabled);
+            if (action.type === 'cancel') {
+                dispatch({ type: 'close_confirm' });
+                setStatus('Confirmation annulée.', 'warn');
+                return;
+            }
+            if (action.type === 'confirm') {
+                const handler = confirmHandlerRef.current[ui.confirm.actionKey];
+                if (handler) {
+                    handler();
+                }
+                delete confirmHandlerRef.current[ui.confirm.actionKey];
+                dispatch({ type: 'close_confirm' });
+                return;
+            }
+            return;
+        }
+
+        if (ui.prompt.open) {
+            const action = resolveGlobalKeyAction(input, key, props.config.keymap.profile, props.config.palette.enabled);
+            if (action.type === 'cancel') {
+                dispatch({ type: 'close_prompt' });
+                promptSubmitRef.current = null;
+                setStatus('Prompt annulé.', 'warn');
+                return;
+            }
+            if (action.type === 'confirm') {
+                const callback = promptSubmitRef.current;
+                const value = ui.prompt.value;
+                dispatch({ type: 'close_prompt' });
+                promptSubmitRef.current = null;
+                if (callback) callback(value);
+                return;
+            }
+            if (action.type === 'backspace') {
+                dispatch({ type: 'prompt_set', value: ui.prompt.value.slice(0, -1) });
+                return;
+            }
+            if (action.type === 'input_char') {
+                dispatch({ type: 'prompt_set', value: `${ui.prompt.value}${action.value}` });
+            }
+            return;
+        }
+
+        if (ui.palette.open) {
+            const action = resolveGlobalKeyAction(input, key, props.config.keymap.profile, props.config.palette.enabled);
+            if (action.type === 'cancel' || (action.type === 'open_palette')) {
+                dispatch({ type: 'close_palette' });
+                return;
+            }
+            if (action.type === 'move_up') {
+                dispatch({ type: 'palette_move', delta: -1, max: rankedPaletteItems.length });
+                return;
+            }
+            if (action.type === 'move_down') {
+                dispatch({ type: 'palette_move', delta: 1, max: rankedPaletteItems.length });
+                return;
+            }
+            if (action.type === 'confirm') {
+                const item = rankedPaletteItems[ensureIndex(ui.palette.selectedIndex, rankedPaletteItems.length)];
+                if (item) {
+                    executePaletteAction(item);
+                }
+                dispatch({ type: 'close_palette' });
+                return;
+            }
+            if (action.type === 'backspace') {
+                dispatch({ type: 'palette_query', query: ui.palette.query.slice(0, -1) });
+                return;
+            }
+            if (action.type === 'input_char') {
+                dispatch({ type: 'palette_query', query: `${ui.palette.query}${action.value}` });
+            }
+            return;
+        }
+
+        if (ui.activeTab === 'editor' && input === 'j') {
+            applyTabAction(input, key);
+            return;
+        }
+
+        const action = resolveGlobalKeyAction(input, key, props.config.keymap.profile, props.config.palette.enabled);
+
+        if (action.type === 'quit') {
+            exit();
+            return;
+        }
+        if (action.type === 'toggle_help') {
+            dispatch({ type: 'toggle_help' });
+            return;
+        }
+        if (action.type === 'open_palette') {
+            dispatch({ type: 'open_palette' });
+            return;
+        }
+        if (action.type === 'switch_tab') {
+            dispatch({ type: 'switch_tab', tab: action.tab });
+            dispatch({ type: 'set_focus', zone: defaultFocusForTab(action.tab) });
+            return;
+        }
+        if (action.type === 'cycle_focus') {
+            dispatch({ type: 'cycle_focus', reverse: action.reverse });
+            return;
+        }
+        if (action.type === 'move_up') {
+            moveByFocus(-1);
+            return;
+        }
+        if (action.type === 'move_down') {
+            moveByFocus(1);
+            return;
+        }
+
+        applyTabAction(input, key);
     });
 
-    const selectedHistory = historyRows[selectedHistoryIndex];
-    const selectedTrigger = triggerRows[selectedTriggerIndex];
-    const selectedApproval = approvals[selectedApprovalIndex];
-    const visibleEvents = tailWindow(eventLines, 22, eventOffset);
-    const visibleLogs = tailWindow(logLines, 12, logOffset);
+    const shellHelp = useMemo(() => {
+        const prompt = ui.prompt.open ? 'PROMPT' : ui.confirm.open ? 'CONFIRM' : ui.palette.open ? 'PALETTE' : 'NORMAL';
+        return `Mode ${prompt} | 1..7 tabs | Tab/Shift+Tab focus | Ctrl+K palette | ? help | editor: ${resolveEditorCommand()}`;
+    }, [ui.confirm.open, ui.palette.open, ui.prompt.open]);
 
     return (
         <Box flexDirection="column" paddingX={1}>
-            <Box borderStyle="round" borderColor="cyan" paddingX={1}>
-                <Box flexDirection="column" flexGrow={1}>
-                    <Text color="cyanBright">LEION ROOTS TUI</Text>
-                    <Text color="gray">Workspace: {props.workspaceRoot}</Text>
-                </Box>
-                <Text color={statusColor(String(selectedRun?.status || 'idle'))}>
-                    {String(selectedRun?.status || 'idle').toUpperCase()}
+            <Header
+                theme={theme}
+                workspaceRoot={props.workspaceRoot}
+                selectedRunId={selectedRunId}
+                selectedRunStatus={String(selectedRun?.status || 'idle')}
+                uiVersion={`v2 (${props.config.keymap.profile})`}
+            />
+
+            <TabBar activeTab={ui.activeTab} theme={theme} />
+
+            {ui.activeTab === 'run' && (
+                <RunScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    runs={runs}
+                    selectedRunIndex={ui.selectedRunIndex}
+                    visibleEvents={visibleEvents}
+                    visibleLogs={visibleLogs}
+                    eventTotal={eventLines.length}
+                    eventMax={props.config.maxEvents}
+                    logTotal={logLines.length}
+                    logMax={props.config.maxLogs}
+                    eventOffset={ui.eventOffset}
+                    logOffset={ui.logOffset}
+                />
+            )}
+
+            {ui.activeTab === 'pipelines' && (
+                <PipelinesScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    pipelines={pipelines}
+                    selectedPipelineIndex={ui.selectedPipelineIndex}
+                />
+            )}
+
+            {ui.activeTab === 'editor' && (
+                <EditorScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    pipelinePath={String(selectedPipeline?.path || '')}
+                    nodes={editorNodes}
+                    selectedNodeIndex={ui.selectedEditorNodeIndex}
+                    yamlPreview={yamlPreview}
+                />
+            )}
+
+            {ui.activeTab === 'history' && (
+                <HistoryScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    historyRows={historyRows}
+                    selectedHistoryIndex={ui.selectedHistoryIndex}
+                />
+            )}
+
+            {ui.activeTab === 'diff' && (
+                <DiffScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    source={diffSource}
+                    lines={diffLines}
+                />
+            )}
+
+            {ui.activeTab === 'triggers' && (
+                <TriggersScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    triggerRows={triggerRows}
+                    selectedTriggerIndex={ui.selectedTriggerIndex}
+                />
+            )}
+
+            {ui.activeTab === 'hitl' && (
+                <HitlScreen
+                    theme={theme}
+                    focusZone={ui.focusZone}
+                    approvals={approvals}
+                    selectedApprovalIndex={ui.selectedApprovalIndex}
+                />
+            )}
+
+            <Footer
+                theme={theme}
+                statusText={`${theme.symbols.bullet} ${ui.status.text}`}
+                tone={ui.status.tone}
+                helpHint={shellHelp}
+            />
+
+            <Box marginTop={1}>
+                <Text color={theme.colors.muted}>
+                    Run actif: {selectedRunId || '-'} {theme.symbols.separator} Pipeline: {String(selectedPipeline?.name || '-')} {theme.symbols.separator} History: {String(selectedHistory?.id || '-')} {theme.symbols.separator} Trigger: {String(selectedTrigger?.id || '-')} {theme.symbols.separator} HITL: {String(selectedApproval?.id || '-')} {theme.symbols.separator} Heure: {formatTime(Date.now())} {theme.symbols.separator} Status: {toUpperSafe(selectedRun?.status || 'idle')}
                 </Text>
             </Box>
 
-            <Box borderStyle="round" borderColor="blue" paddingX={1} marginTop={1}>
-                <Text color={tab === 'run' ? 'black' : 'cyan'} backgroundColor={tab === 'run' ? 'cyan' : undefined}>{tabLabel('1 Run', tab === 'run')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'pipelines' ? 'black' : 'cyan'} backgroundColor={tab === 'pipelines' ? 'cyan' : undefined}>{tabLabel('2 Pipelines', tab === 'pipelines')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'editor' ? 'black' : 'cyan'} backgroundColor={tab === 'editor' ? 'cyan' : undefined}>{tabLabel('3 Editor', tab === 'editor')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'history' ? 'black' : 'cyan'} backgroundColor={tab === 'history' ? 'cyan' : undefined}>{tabLabel('4 History', tab === 'history')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'diff' ? 'black' : 'cyan'} backgroundColor={tab === 'diff' ? 'cyan' : undefined}>{tabLabel('5 Diff', tab === 'diff')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'triggers' ? 'black' : 'cyan'} backgroundColor={tab === 'triggers' ? 'cyan' : undefined}>{tabLabel('6 Triggers', tab === 'triggers')}</Text>
-                <Text> </Text>
-                <Text color={tab === 'hitl' ? 'black' : 'cyan'} backgroundColor={tab === 'hitl' ? 'cyan' : undefined}>{tabLabel('7 HITL', tab === 'hitl')}</Text>
+            {ui.showHelp && <HelpOverlay theme={theme} />}
+
+            {ui.palette.open && (
+                <CommandPalette
+                    theme={theme}
+                    query={ui.palette.query}
+                    items={rankedPaletteItems}
+                    selectedIndex={ensureIndex(ui.palette.selectedIndex, rankedPaletteItems.length)}
+                />
+            )}
+
+            {ui.prompt.open && (
+                <PromptOverlay
+                    theme={theme}
+                    title={ui.prompt.title}
+                    value={ui.prompt.value}
+                    description={ui.prompt.description}
+                />
+            )}
+
+            {ui.confirm.open && (
+                <ConfirmOverlay
+                    theme={theme}
+                    title={ui.confirm.title}
+                    body={ui.confirm.body}
+                />
+            )}
+
+            <Box marginTop={1}>
+                <Text color={theme.colors.muted}>Config: intentRouter.tui.ui.version | theme.highContrast | keymap.profile | palette.enabled | palette.trigger</Text>
             </Box>
-
-            {tab === 'run' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="35%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle(`Runs (${runs.length})`)}</Text>
-                        <Text color="gray">↑/↓ select, p pause, r resume, c cancel</Text>
-                        {runs.slice(0, 20).map((entry, idx) => {
-                            const selected = idx === selectedRunIndex;
-                            const id = String(entry?.detachedRunId || entry?.pipelineRunId || '?');
-                            return (
-                                <Text key={id} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {id} [<Text color={statusColor(String(entry?.status || '-'))}>{String(entry?.status || '-')}</Text>]
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="65%" borderStyle="round" borderColor="magenta" paddingX={1}>
-                        <Text color="magentaBright">{sectionTitle(`Events ${eventLines.length}/${config.maxEvents}`)}</Text>
-                        <Text color="gray">[ / ] scroll</Text>
-                        {visibleEvents.map((line, idx) => (
-                            <Text key={`ev-${idx}`}>{line}</Text>
-                        ))}
-                        <Text color="magentaBright">{sectionTitle(`Logs ${logLines.length}/${config.maxLogs}`)}</Text>
-                        <Text color="gray">{'{ / }'} scroll</Text>
-                        {visibleLogs.map((line, idx) => (
-                            <Text key={`log-${idx}`}>{line}</Text>
-                        ))}
-                    </Box>
-                </Box>
-            )}
-
-            {tab === 'pipelines' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="45%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle(`Pipelines (${pipelines.length})`)}</Text>
-                        <Text color="gray">↑/↓, Enter/r run, d dry-run, n new, x delete, e editor</Text>
-                        {pipelines.slice(0, 30).map((entry, idx) => {
-                            const selected = idx === selectedPipelineIndex;
-                            const key = String(entry?.path || idx);
-                            return (
-                                <Text key={key} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {String(entry?.name || '?')}
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="55%" borderStyle="round" borderColor="yellow" paddingX={1}>
-                        <Text color="yellowBright">{sectionTitle('Selected Pipeline')}</Text>
-                        <Text>{String(pipelines[selectedPipelineIndex]?.path || '-')}</Text>
-                    </Box>
-                </Box>
-            )}
-
-            {tab === 'editor' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="45%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle('Nodes')}</Text>
-                        <Text color="gray">↑/↓ select | a add(yaml) | y edit node yaml | v full pipeline yaml</Text>
-                        <Text color="gray">x delete | u/j reorder | i intent | m desc | o on_failure | c command</Text>
-                        {editorNodes.slice(0, 35).map((entry, idx) => {
-                            const selected = idx === selectedEditorNodeIndex;
-                            const key = String(entry?.id || idx);
-                            return (
-                                <Text key={key} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {String(entry?.id || '?')} :: {String(entry?.intent || '-')}
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="55%" borderStyle="round" borderColor="blue" paddingX={1}>
-                        <Text color="blueBright">{sectionTitle('Node Inspector')}</Text>
-                        <Text color="gray">pipeline: {String(pipelines[selectedPipelineIndex]?.path || '-')}</Text>
-                        <Text>id: {String(selectedEditorNode?.id || '-')}</Text>
-                        <Text>intent: {String(selectedEditorNode?.intent || '-')}</Text>
-                        <Text>description: {String(selectedEditorNode?.description || '-')}</Text>
-                        <Text>onFailure: {String(selectedEditorNode?.onFailure || '-')}</Text>
-                        <Text>command: {String(selectedEditorNode?.payload?.command || '-')}</Text>
-                    </Box>
-                </Box>
-            )}
-
-            {tab === 'history' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="45%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle(`History (${historyRows.length})`)}</Text>
-                        <Text color="gray">↑/↓ select</Text>
-                        {historyRows.slice(0, 30).map((entry, idx) => {
-                            const selected = idx === selectedHistoryIndex;
-                            const key = String(entry?.id || idx);
-                            return (
-                                <Text key={key} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {String(entry?.id || '?')} [{String(entry?.status || '-')}] {formatTime(entry?.timestamp)}
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="55%" borderStyle="round" borderColor="yellow" paddingX={1}>
-                        <Text color="yellowBright">{sectionTitle('Selected Run Detail')}</Text>
-                        <Text>id: {String(selectedHistory?.id || '-')}</Text>
-                        <Text>name: {String(selectedHistory?.name || '-')}</Text>
-                        <Text>status: <Text color={statusColor(String(selectedHistory?.status || '-'))}>{String(selectedHistory?.status || '-')}</Text></Text>
-                        <Text>steps: {String(Array.isArray(selectedHistory?.steps) ? selectedHistory.steps.length : 0)}</Text>
-                    </Box>
-                </Box>
-            )}
-
-            {tab === 'diff' && (
-                <Box marginTop={1} borderStyle="round" borderColor="magenta" paddingX={1} flexDirection="column">
-                    <Text color="magentaBright">{sectionTitle(`Diff source: ${diffSource}`)}</Text>
-                    <Text color="gray">f refresh</Text>
-                    {diffLines.length === 0 && <Text color="gray">No diff data available.</Text>}
-                    {diffLines.slice(0, 40).map((line, idx) => (
-                        <Text key={`diff-${idx}`}>{line}</Text>
-                    ))}
-                </Box>
-            )}
-
-            {tab === 'triggers' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="45%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle(`Triggers (${triggerRows.length})`)}</Text>
-                        <Text color="gray">↑/↓ select, s start, x stop, f refresh</Text>
-                        {triggerRows.slice(0, 30).map((entry, idx) => {
-                            const selected = idx === selectedTriggerIndex;
-                            const key = String(entry?.id || idx);
-                            return (
-                                <Text key={key} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {String(entry?.kind || '?')} {String(entry?.pipelineName || '-')}::{String(entry?.stepId || '-')}
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="55%" borderStyle="round" borderColor="yellow" paddingX={1}>
-                        <Text color="yellowBright">{sectionTitle('Selected Trigger')}</Text>
-                        <Text>id: {String(selectedTrigger?.id || '-')}</Text>
-                        <Text>intent: {String(selectedTrigger?.intent || '-')}</Text>
-                        <Text>enabled: {String(selectedTrigger?.enabled === true)}</Text>
-                    </Box>
-                </Box>
-            )}
-
-            {tab === 'hitl' && (
-                <Box marginTop={1}>
-                    <Box flexDirection="column" width="45%" borderStyle="round" borderColor="green" paddingX={1} marginRight={1}>
-                        <Text color="greenBright">{sectionTitle(`Approvals (${approvals.length})`)}</Text>
-                        <Text color="gray">↑/↓ select, a approve, r reject</Text>
-                        {approvals.slice(0, 30).map((entry, idx) => {
-                            const selected = idx === selectedApprovalIndex;
-                            const key = String(entry?.id || idx);
-                            return (
-                                <Text key={key} color={selected ? 'magentaBright' : undefined}>
-                                    {selected ? '>' : ' '} {String(entry?.runId || '?')}::{String(entry?.nodeId || '-')}
-                                </Text>
-                            );
-                        })}
-                    </Box>
-                    <Box flexDirection="column" width="55%" borderStyle="round" borderColor="yellow" paddingX={1}>
-                        <Text color="yellowBright">{sectionTitle('Selected Approval')}</Text>
-                        <Text>id: {String(selectedApproval?.id || '-')}</Text>
-                        <Text>prompt: {String(selectedApproval?.prompt || '-')}</Text>
-                        <Text>source: {String(selectedApproval?.source || '-')}</Text>
-                    </Box>
-                </Box>
-            )}
-
-            <Box borderStyle="round" borderColor="gray" paddingX={1} marginTop={1}>
-                <Text color="yellow">{statusLine}</Text>
-                <Text> </Text>
-                <Text color="gray">Keys: 1..7 tabs, q quit</Text>
-            </Box>
-
-            {promptOpen && (
-                <Box borderStyle="round" borderColor="yellow" paddingX={1} marginTop={1}>
-                    <Text color="yellowBright">{promptTitle}: </Text>
-                    <Text color="white">{promptValue}</Text>
-                    <Text color="gray"> (Enter confirm, Esc cancel)</Text>
-                </Box>
-            )}
         </Box>
     );
 }

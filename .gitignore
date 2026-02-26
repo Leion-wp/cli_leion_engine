@@ -27,3 +27,8 @@ pipeline/history.json
 *.sh
 
 docs/
+!docs/
+docs/*
+!docs/milestones/
+!*.md
+
