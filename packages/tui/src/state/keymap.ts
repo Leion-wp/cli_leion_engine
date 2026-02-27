@@ -22,6 +22,7 @@ export type GlobalKeyAction =
     | { type: 'toggle_help' }
     | { type: 'open_palette' }
     | { type: 'switch_tab'; tab: TabId }
+    | { type: 'switch_tab_relative'; delta: -1 | 1 }
     | { type: 'cycle_focus'; reverse?: boolean }
     | { type: 'move_up' }
     | { type: 'move_down' }
@@ -33,6 +34,13 @@ export type GlobalKeyAction =
 export function resolveGlobalKeyAction(input: string, key: InkLikeKey, profile: TuiKeymapProfile, paletteEnabled: boolean): GlobalKeyAction {
     if ((key.ctrl && input === 'c') || input === 'q') return { type: 'quit' };
     if (input === '?') return { type: 'toggle_help' };
+
+    // Many terminals don't expose Shift+Arrow as a distinct modifier in TUI mode.
+    // We accept both Shift+Arrow and plain Left/Right for deterministic tab switching.
+    if (key.shift && key.leftArrow) return { type: 'switch_tab_relative', delta: -1 };
+    if (key.shift && key.rightArrow) return { type: 'switch_tab_relative', delta: 1 };
+    if (key.leftArrow) return { type: 'switch_tab_relative', delta: -1 };
+    if (key.rightArrow) return { type: 'switch_tab_relative', delta: 1 };
 
     if (paletteEnabled && key.ctrl && input.toLowerCase() === 'k') {
         return { type: 'open_palette' };

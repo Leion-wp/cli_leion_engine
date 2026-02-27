@@ -21,3 +21,31 @@ test('resolveGlobalKeyAction maps tab switch shortcuts', () => {
         assert.equal(action.tab, 'editor');
     }
 });
+
+test('resolveGlobalKeyAction maps shift arrows to relative tab switch', () => {
+    const left = resolveGlobalKeyAction('', { shift: true, leftArrow: true }, 'hybrid', true);
+    const right = resolveGlobalKeyAction('', { shift: true, rightArrow: true }, 'hybrid', true);
+
+    assert.equal(left.type, 'switch_tab_relative');
+    assert.equal(right.type, 'switch_tab_relative');
+    if (left.type === 'switch_tab_relative') {
+        assert.equal(left.delta, -1);
+    }
+    if (right.type === 'switch_tab_relative') {
+        assert.equal(right.delta, 1);
+    }
+});
+
+test('resolveGlobalKeyAction maps plain left/right arrows to relative tab switch fallback', () => {
+    const left = resolveGlobalKeyAction('', { leftArrow: true }, 'hybrid', true);
+    const right = resolveGlobalKeyAction('', { rightArrow: true }, 'hybrid', true);
+
+    assert.equal(left.type, 'switch_tab_relative');
+    assert.equal(right.type, 'switch_tab_relative');
+    if (left.type === 'switch_tab_relative') {
+        assert.equal(left.delta, -1);
+    }
+    if (right.type === 'switch_tab_relative') {
+        assert.equal(right.delta, 1);
+    }
+});

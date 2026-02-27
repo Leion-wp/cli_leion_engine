@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "npm --prefix ../core run build && tsc -p ./tsconfig.json",
-    "test": "npm run build && node --test out/__tests__/config.test.js out/__tests__/keymap.test.js out/__tests__/palette.test.js out/__tests__/machine.test.js"
+    "test": "npm run build && node --test out/__tests__/config.test.js out/__tests__/keymap.test.js out/__tests__/palette.test.js out/__tests__/machine.test.js out/__tests__/filtering.test.js"
   },
   "dependencies": {
     "ink": "^3.2.0",

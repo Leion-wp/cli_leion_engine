@@ -6,9 +6,12 @@ export function HelpOverlay(props: { theme: TuiTheme }): JSX.Element {
     return (
         <Box borderStyle="double" borderColor={props.theme.colors.accentAlt} paddingX={1} flexDirection="column" marginTop={1}>
             <Text color={props.theme.colors.accent}>Aide clavier (hybrid)</Text>
-            <Text color={props.theme.colors.muted}>Tabs: 1..7 | Focus: Tab / Shift+Tab | Quit: q or Ctrl+C | Help: ?</Text>
-            <Text color={props.theme.colors.muted}>Navigation: ↑/↓ ou j/k | Palette: Ctrl+K | Prompt: Enter/Esc</Text>
-            <Text color={props.theme.colors.muted}>Run: p pause, r resume, c cancel | Diff: f refresh | Triggers: s/x/f | HITL: a/r</Text>
+            <Text color={props.theme.colors.muted}>Navigation globale</Text>
+            <Text color={props.theme.colors.muted}>[1..7] tab direct  [Shift+Left/Right] tab suivant/précédent  [Tab] changer focus</Text>
+            <Text color={props.theme.colors.muted}>[Ctrl+K ou /] palette  [F] filtre tab  [C] clear filtre  [R] refresh tab  [g/G] jump</Text>
+            <Text color={props.theme.colors.muted}>[?] aide  [q] quitter</Text>
+            <Text color={props.theme.colors.muted}>Actions métier</Text>
+            <Text color={props.theme.colors.muted}>Run: [p] pause [r] resume [c] cancel | Diff: [f] refresh | Triggers: [s/x/f] | HITL: [a/r]</Text>
         </Box>
     );
 }

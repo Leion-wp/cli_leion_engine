@@ -2,9 +2,15 @@
 
 ## Global
 - `1..7`: switch tab
+- `Shift+←` / `Shift+→`: previous/next tab
+- Fallback terminal: `←` / `→` switch aussi les tabs si Shift n'est pas transmis
 - `Tab` / `Shift+Tab`: cycle focus panels
-- `Ctrl+K`: command palette
+- `Ctrl+K` or `/`: command palette
 - `?`: help overlay
+- `g` / `G`: jump first/last in focused list
+- `R`: refresh active tab
+- `F`: open filter prompt for active tab
+- `C`: clear active tab filter
 - `q` or `Ctrl+C`: quit
 
 ## Navigation

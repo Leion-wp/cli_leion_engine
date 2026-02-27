@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { Box, Text, useApp, useInput } from 'ink';
+import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import { LegacyApp } from './legacyApp';
 import { loadTuiConfig } from './state/config';
 import { defaultFocusForTab, resolveGlobalKeyAction } from './state/keymap';
-import { TAB_SHORTCUTS, createInitialUiState, uiReducer } from './state/machines';
+import { shiftTab, TAB_SHORTCUTS, createInitialUiState, uiReducer } from './state/machines';
 import { rankPaletteItems } from './state/palette';
 import { CommandPaletteItem, TabId, TuiRuntimeConfig } from './state/types';
 import {
@@ -23,6 +23,7 @@ import {
     tailWindow,
     tryExtractLogLine
 } from './services/formatters';
+import { boundaryWithinView, filterWithIndex, moveWithinView } from './services/filtering';
 import { DiffScreen } from './screens/diffScreen';
 import { EditorScreen } from './screens/editorScreen';
 import { HistoryScreen } from './screens/historyScreen';
@@ -31,8 +32,9 @@ import { PipelinesScreen } from './screens/pipelinesScreen';
 import { RunScreen } from './screens/runScreen';
 import { TriggersScreen } from './screens/triggersScreen';
 import { CommandPalette } from './ui/palette';
-import { Footer, Header, TabBar } from './ui/primitives';
+import { Footer, Header, KeybindStrip, TabBar } from './ui/primitives';
 import { ConfirmOverlay, HelpOverlay, PromptOverlay } from './ui/overlays';
+import { computeLayoutMode } from './ui/layout';
 import { createTheme } from './ui/theme';
 
 const core: any = require('../../core/out/index');
@@ -51,6 +53,8 @@ type ModernAppProps = {
     config: TuiRuntimeConfig;
 };
 
+type FilterKey = 'run' | 'pipelines' | 'editor' | 'history' | 'diff' | 'triggers' | 'hitl';
+
 function toUpperSafe(value: unknown): string {
     return String(value || '').trim().toUpperCase();
 }
@@ -60,6 +64,22 @@ function ensureIndex(index: number, size: number): number {
     if (index < 0) return 0;
     if (index >= size) return size - 1;
     return index;
+}
+
+function compactText(input: string, maxChars: number): string {
+    if (input.length <= maxChars) return input;
+    if (maxChars <= 1) return input.slice(0, maxChars);
+    return `${input.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+function filterKeyForTab(tab: TabId): FilterKey {
+    if (tab === 'run') return 'run';
+    if (tab === 'pipelines') return 'pipelines';
+    if (tab === 'editor') return 'editor';
+    if (tab === 'history') return 'history';
+    if (tab === 'diff') return 'diff';
+    if (tab === 'triggers') return 'triggers';
+    return 'hitl';
 }
 
 export function App(props: AppProps): JSX.Element {
@@ -88,6 +108,8 @@ export function App(props: AppProps): JSX.Element {
 
 function ModernApp(props: ModernAppProps): JSX.Element {
     const { exit } = useApp();
+    const { stdout } = useStdout();
+    const [stdoutColumns, setStdoutColumns] = useState<number>(Number(stdout?.columns || process.stdout.columns || 120));
     const [ui, dispatch] = useReducer(uiReducer, undefined, createInitialUiState);
     const [runs, setRuns] = useState<any[]>([]);
     const [pipelines, setPipelines] = useState<any[]>([]);
@@ -99,6 +121,15 @@ function ModernApp(props: ModernAppProps): JSX.Element {
     const [diffSource, setDiffSource] = useState<'audit' | 'git' | 'none'>('none');
     const [eventLines, setEventLines] = useState<string[]>([]);
     const [logLines, setLogLines] = useState<string[]>([]);
+    const [filters, setFilters] = useState<Record<FilterKey, string>>({
+        run: '',
+        pipelines: '',
+        editor: '',
+        history: '',
+        diff: '',
+        triggers: '',
+        hitl: ''
+    });
 
     const promptSubmitRef = useRef<((value: string) => void) | null>(null);
     const confirmHandlerRef = useRef<Record<string, (() => void) | undefined>>({});
@@ -109,6 +140,21 @@ function ModernApp(props: ModernAppProps): JSX.Element {
     const initialPipelineAppliedRef = useRef<boolean>(false);
 
     const theme = useMemo(() => createTheme(props.config.theme.highContrast), [props.config.theme.highContrast]);
+    const layoutMode = useMemo(() => computeLayoutMode(stdoutColumns), [stdoutColumns]);
+
+    useEffect(() => {
+        const update = () => setStdoutColumns(Number(stdout?.columns || process.stdout.columns || 120));
+        update();
+        if (!stdout) return undefined;
+        stdout.on('resize', update);
+        return () => {
+            if (typeof (stdout as any).off === 'function') {
+                (stdout as any).off('resize', update);
+            } else {
+                stdout.removeListener('resize', update);
+            }
+        };
+    }, [stdout]);
 
     const runtime = useMemo(() => {
         return new core.CoreRuntime({
@@ -132,8 +178,94 @@ function ModernApp(props: ModernAppProps): JSX.Element {
     const selectedTrigger = triggerRows[ui.selectedTriggerIndex];
     const selectedApproval = approvals[ui.selectedApprovalIndex];
 
-    const visibleEvents = useMemo(() => tailWindow(eventLines, 22, ui.eventOffset), [eventLines, ui.eventOffset]);
-    const visibleLogs = useMemo(() => tailWindow(logLines, 12, ui.logOffset), [logLines, ui.logOffset]);
+    const runView = useMemo(
+        () => filterWithIndex(runs, filters.run, (row) => [row?.detachedRunId, row?.pipelineRunId, row?.status]),
+        [filters.run, runs]
+    );
+    const pipelineView = useMemo(
+        () => filterWithIndex(pipelines, filters.pipelines, (row) => [row?.name, row?.path]),
+        [filters.pipelines, pipelines]
+    );
+    const editorView = useMemo(
+        () => filterWithIndex(editorNodes, filters.editor, (row) => [row?.id, row?.type, row?.intent, row?.description, row?.onFailure, row?.payload]),
+        [editorNodes, filters.editor]
+    );
+    const historyView = useMemo(
+        () => filterWithIndex(historyRows, filters.history, (row) => [row?.id, row?.name, row?.status, row?.timestamp]),
+        [filters.history, historyRows]
+    );
+    const triggerView = useMemo(
+        () => filterWithIndex(triggerRows, filters.triggers, (row) => [row?.id, row?.kind, row?.pipelineName, row?.stepId, row?.intent]),
+        [filters.triggers, triggerRows]
+    );
+    const approvalView = useMemo(
+        () => filterWithIndex(approvals, filters.hitl, (row) => [row?.id, row?.runId, row?.nodeId, row?.prompt, row?.source]),
+        [approvals, filters.hitl]
+    );
+    const diffViewLines = useMemo(() => {
+        const query = filters.diff.trim().toLowerCase();
+        if (!query) return diffLines;
+        return diffLines.filter((line) => String(line || '').toLowerCase().includes(query));
+    }, [diffLines, filters.diff]);
+
+    const runViewIndices = useMemo(() => runView.map((entry) => entry.index), [runView]);
+    const pipelineViewIndices = useMemo(() => pipelineView.map((entry) => entry.index), [pipelineView]);
+    const editorViewIndices = useMemo(() => editorView.map((entry) => entry.index), [editorView]);
+    const historyViewIndices = useMemo(() => historyView.map((entry) => entry.index), [historyView]);
+    const triggerViewIndices = useMemo(() => triggerView.map((entry) => entry.index), [triggerView]);
+    const approvalViewIndices = useMemo(() => approvalView.map((entry) => entry.index), [approvalView]);
+
+    const runList = useMemo(() => runView.map((entry) => entry.row), [runView]);
+    const pipelineList = useMemo(() => pipelineView.map((entry) => entry.row), [pipelineView]);
+    const editorList = useMemo(() => editorView.map((entry) => entry.row), [editorView]);
+    const historyList = useMemo(() => historyView.map((entry) => entry.row), [historyView]);
+    const triggerList = useMemo(() => triggerView.map((entry) => entry.row), [triggerView]);
+    const approvalList = useMemo(() => approvalView.map((entry) => entry.row), [approvalView]);
+
+    const selectedRunVisibleIndex = useMemo(() => runViewIndices.indexOf(ui.selectedRunIndex), [runViewIndices, ui.selectedRunIndex]);
+    const selectedPipelineVisibleIndex = useMemo(() => pipelineViewIndices.indexOf(ui.selectedPipelineIndex), [pipelineViewIndices, ui.selectedPipelineIndex]);
+    const selectedEditorVisibleIndex = useMemo(() => editorViewIndices.indexOf(ui.selectedEditorNodeIndex), [editorViewIndices, ui.selectedEditorNodeIndex]);
+    const selectedHistoryVisibleIndex = useMemo(() => historyViewIndices.indexOf(ui.selectedHistoryIndex), [historyViewIndices, ui.selectedHistoryIndex]);
+    const selectedTriggerVisibleIndex = useMemo(() => triggerViewIndices.indexOf(ui.selectedTriggerIndex), [triggerViewIndices, ui.selectedTriggerIndex]);
+    const selectedApprovalVisibleIndex = useMemo(() => approvalViewIndices.indexOf(ui.selectedApprovalIndex), [approvalViewIndices, ui.selectedApprovalIndex]);
+
+    const eventWindowSize = layoutMode === 'wide' ? 22 : layoutMode === 'compact' ? 16 : 10;
+    const logWindowSize = layoutMode === 'wide' ? 12 : layoutMode === 'compact' ? 10 : 8;
+    const visibleEvents = useMemo(() => tailWindow(eventLines, eventWindowSize, ui.eventOffset), [eventLines, eventWindowSize, ui.eventOffset]);
+    const visibleLogs = useMemo(() => tailWindow(logLines, logWindowSize, ui.logOffset), [logLines, logWindowSize, ui.logOffset]);
+    const tabCounts = useMemo(() => {
+        return {
+            run: { visible: runList.length, total: runs.length, filtered: Boolean(filters.run.trim()) },
+            pipelines: { visible: pipelineList.length, total: pipelines.length, filtered: Boolean(filters.pipelines.trim()) },
+            editor: { visible: editorList.length, total: editorNodes.length, filtered: Boolean(filters.editor.trim()) },
+            history: { visible: historyList.length, total: historyRows.length, filtered: Boolean(filters.history.trim()) },
+            diff: { visible: diffViewLines.length, total: diffLines.length, filtered: Boolean(filters.diff.trim()) },
+            triggers: { visible: triggerList.length, total: triggerRows.length, filtered: Boolean(filters.triggers.trim()) },
+            hitl: { visible: approvalList.length, total: approvals.length, filtered: Boolean(filters.hitl.trim()) }
+        };
+    }, [
+        approvalList.length,
+        approvals.length,
+        diffLines.length,
+        diffViewLines.length,
+        editorList.length,
+        editorNodes.length,
+        filters.diff,
+        filters.editor,
+        filters.history,
+        filters.hitl,
+        filters.pipelines,
+        filters.run,
+        filters.triggers,
+        historyList.length,
+        historyRows.length,
+        pipelineList.length,
+        pipelines.length,
+        runList.length,
+        runs.length,
+        triggerList.length,
+        triggerRows.length
+    ]);
 
     const yamlPreview = useMemo(() => {
         if (!selectedEditorNode) return [];
@@ -342,6 +474,158 @@ function ModernApp(props: ModernAppProps): JSX.Element {
         }
     }, [refreshRuns, setStatus, supervisor]);
 
+    const refreshCurrentTab = useCallback(() => {
+        if (ui.activeTab === 'run') {
+            refreshRuns();
+            tailSelectedRun();
+            setStatus('Refresh tab Run exécuté.', 'ok');
+            return;
+        }
+        if (ui.activeTab === 'pipelines') {
+            refreshPipelines();
+            setStatus('Refresh tab Pipelines exécuté.', 'ok');
+            return;
+        }
+        if (ui.activeTab === 'editor') {
+            refreshEditorNodes();
+            setStatus('Refresh tab Editor exécuté.', 'ok');
+            return;
+        }
+        if (ui.activeTab === 'history') {
+            void refreshHistory();
+            setStatus('Refresh tab History exécuté.', 'ok');
+            return;
+        }
+        if (ui.activeTab === 'diff') {
+            void refreshDiff();
+            setStatus('Refresh tab Diff exécuté.', 'ok');
+            return;
+        }
+        if (ui.activeTab === 'triggers') {
+            refreshTriggers();
+            setStatus('Refresh tab Triggers exécuté.', 'ok');
+            return;
+        }
+        refreshApprovals();
+        setStatus('Refresh tab HITL exécuté.', 'ok');
+    }, [
+        refreshApprovals,
+        refreshDiff,
+        refreshEditorNodes,
+        refreshHistory,
+        refreshPipelines,
+        refreshRuns,
+        refreshTriggers,
+        setStatus,
+        tailSelectedRun,
+        ui.activeTab
+    ]);
+
+    const jumpToBoundary = useCallback((target: 'first' | 'last') => {
+        const goLast = target === 'last';
+        if (ui.activeTab === 'run') {
+            if (ui.focusZone === 'left') {
+                const next = boundaryWithinView(runViewIndices, goLast ? 'last' : 'first');
+                if (next !== undefined) {
+                    dispatch({ type: 'select_index', key: 'run', index: next, max: runs.length });
+                }
+                return;
+            }
+            if (ui.focusZone === 'center') {
+                const delta = goLast ? -999999 : eventLines.length + ui.eventOffset + 999999;
+                dispatch({ type: 'scroll_events', delta });
+                return;
+            }
+            if (ui.focusZone === 'right') {
+                const delta = goLast ? -999999 : logLines.length + ui.logOffset + 999999;
+                dispatch({ type: 'scroll_logs', delta });
+            }
+            return;
+        }
+        if (ui.activeTab === 'pipelines') {
+            const next = boundaryWithinView(pipelineViewIndices, goLast ? 'last' : 'first');
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'pipeline', index: next, max: pipelines.length });
+            }
+            return;
+        }
+        if (ui.activeTab === 'editor') {
+            const next = boundaryWithinView(editorViewIndices, goLast ? 'last' : 'first');
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'editor', index: next, max: editorNodes.length });
+            }
+            return;
+        }
+        if (ui.activeTab === 'history') {
+            const next = boundaryWithinView(historyViewIndices, goLast ? 'last' : 'first');
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'history', index: next, max: historyRows.length });
+            }
+            return;
+        }
+        if (ui.activeTab === 'triggers') {
+            const next = boundaryWithinView(triggerViewIndices, goLast ? 'last' : 'first');
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'trigger', index: next, max: triggerRows.length });
+            }
+            return;
+        }
+        if (ui.activeTab === 'hitl') {
+            const next = boundaryWithinView(approvalViewIndices, goLast ? 'last' : 'first');
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'approval', index: next, max: approvals.length });
+            }
+        }
+    }, [
+        approvalViewIndices,
+        approvals.length,
+        editorNodes.length,
+        editorViewIndices,
+        eventLines.length,
+        historyViewIndices,
+        historyRows.length,
+        logLines.length,
+        pipelineViewIndices,
+        pipelines.length,
+        runViewIndices,
+        runs.length,
+        triggerViewIndices,
+        triggerRows.length,
+        ui.activeTab,
+        ui.eventOffset,
+        ui.focusZone,
+        ui.logOffset
+    ]);
+
+    const openCurrentTabFilter = useCallback(() => {
+        const key = filterKeyForTab(ui.activeTab);
+        const currentValue = filters[key];
+        openPrompt(
+            `Filtre tab ${ui.activeTab}`,
+            currentValue,
+            (value) => {
+                setFilters((previous) => ({
+                    ...previous,
+                    [key]: String(value || '').trim()
+                }));
+                setStatus(String(value || '').trim() ? `Filtre ${ui.activeTab} appliqué.` : `Filtre ${ui.activeTab} vidé.`, 'ok');
+            },
+            'Filtre local de la tab active (insensible à la casse).'
+        );
+    }, [filters, openPrompt, setStatus, ui.activeTab]);
+
+    const clearCurrentTabFilter = useCallback(() => {
+        const key = filterKeyForTab(ui.activeTab);
+        setFilters((previous) => {
+            if (!previous[key]) return previous;
+            return {
+                ...previous,
+                [key]: ''
+            };
+        });
+        setStatus(`Filtre ${ui.activeTab} vidé.`, 'info');
+    }, [setStatus, ui.activeTab]);
+
     const executePaletteAction = useCallback((item: CommandPaletteItem) => {
         if (item.id === 'action:refresh') {
             refreshRuns();
@@ -354,6 +638,32 @@ function ModernApp(props: ModernAppProps): JSX.Element {
             setStatus('Refresh global exécuté.', 'ok');
             return;
         }
+        if (item.id === 'action:refresh-current') {
+            refreshCurrentTab();
+            return;
+        }
+        if (item.id === 'action:jump-first') {
+            jumpToBoundary('first');
+            setStatus('Jump vers le premier élément.', 'info');
+            return;
+        }
+        if (item.id === 'action:jump-last') {
+            jumpToBoundary('last');
+            setStatus('Jump vers le dernier élément.', 'info');
+            return;
+        }
+        if (item.id === 'action:toggle-help') {
+            dispatch({ type: 'toggle_help' });
+            return;
+        }
+        if (item.id === 'action:filter-current') {
+            openCurrentTabFilter();
+            return;
+        }
+        if (item.id === 'action:filter-clear') {
+            clearCurrentTabFilter();
+            return;
+        }
         if (item.id === 'action:theme-toggle') {
             setStatus('Mode high-contrast se configure via intentRouter.tui.theme.highContrast.', 'info');
             return;
@@ -362,17 +672,146 @@ function ModernApp(props: ModernAppProps): JSX.Element {
             setStatus('Relance: leion-roots tui --legacy', 'info');
             return;
         }
+        if (item.id === 'action:run-pause' && selectedRunId) {
+            try {
+                supervisor.pause_run(selectedRunId);
+                setStatus(`Pause demandée pour ${selectedRunId}`, 'warn');
+            } catch (error: any) {
+                setStatus(`Pause échouée: ${String(error?.message || error)}`, 'err');
+            }
+            return;
+        }
+        if (item.id === 'action:run-resume' && selectedRunId) {
+            try {
+                supervisor.resume_run(selectedRunId);
+                setStatus(`Resume demandée pour ${selectedRunId}`, 'ok');
+            } catch (error: any) {
+                setStatus(`Resume échouée: ${String(error?.message || error)}`, 'err');
+            }
+            return;
+        }
+        if (item.id === 'action:run-cancel' && selectedRunId) {
+            openConfirm(
+                'Confirmer cancel run',
+                `Annuler définitivement le run ${selectedRunId} ?`,
+                () => {
+                    try {
+                        supervisor.cancel_run(selectedRunId);
+                        setStatus(`Cancel demandé pour ${selectedRunId}`, 'warn');
+                    } catch (error: any) {
+                        setStatus(`Cancel échoué: ${String(error?.message || error)}`, 'err');
+                    }
+                }
+            );
+            return;
+        }
+        if (item.id === 'action:pipeline-run' && selectedPipeline) {
+            startDetachedPipeline(selectedPipeline);
+            return;
+        }
+        if (item.id === 'action:pipeline-dry' && selectedPipeline) {
+            void runtime.run_pipeline_file(String(selectedPipeline.path || ''), { dryRun: true })
+                .then((result: any) => {
+                    setStatus(`Dry-run ${result?.success ? 'ok' : 'failed'} (${String(result?.runId || '-')})`, result?.success ? 'ok' : 'warn');
+                })
+                .catch((error: any) => {
+                    setStatus(`Dry-run échoué: ${String(error?.message || error)}`, 'err');
+                });
+            return;
+        }
+        if (item.id === 'action:pipeline-open-editor') {
+            dispatch({ type: 'switch_tab', tab: 'editor' });
+            dispatch({ type: 'set_focus', zone: defaultFocusForTab('editor') });
+            return;
+        }
+        if (item.id === 'action:diff-refresh') {
+            void refreshDiff();
+            setStatus('Diff refresh demandée.', 'ok');
+            return;
+        }
+        if (item.id === 'action:trigger-start') {
+            void triggerService.start()
+                .then(() => setStatus('Triggers démarrés.', 'ok'))
+                .catch((error: any) => setStatus(`Start triggers échoué: ${String(error?.message || error)}`, 'err'));
+            return;
+        }
+        if (item.id === 'action:trigger-stop') {
+            void triggerService.stop()
+                .then(() => setStatus('Triggers stoppés.', 'warn'))
+                .catch((error: any) => setStatus(`Stop triggers échoué: ${String(error?.message || error)}`, 'err'));
+            return;
+        }
+        if (item.id === 'action:trigger-refresh') {
+            void triggerService.refresh()
+                .then(() => {
+                    refreshTriggers();
+                    setStatus('Triggers refresh exécuté.', 'ok');
+                })
+                .catch((error: any) => setStatus(`Refresh triggers échoué: ${String(error?.message || error)}`, 'err'));
+            return;
+        }
+        if (item.id === 'action:approval-approve' && selectedApproval) {
+            try {
+                approvalService.resolve({ pendingId: selectedApproval.id, decision: 'approve' });
+                refreshApprovals();
+                setStatus(`Approval accepté: ${String(selectedApproval.id)}`, 'ok');
+            } catch (error: any) {
+                setStatus(`Approve échoué: ${String(error?.message || error)}`, 'err');
+            }
+            return;
+        }
+        if (item.id === 'action:approval-reject' && selectedApproval) {
+            openConfirm(
+                'Confirmer reject approval',
+                `Reject ${String(selectedApproval.id)} ?`,
+                () => {
+                    try {
+                        approvalService.resolve({ pendingId: selectedApproval.id, decision: 'reject' });
+                        refreshApprovals();
+                        setStatus(`Approval rejeté: ${String(selectedApproval.id)}`, 'warn');
+                    } catch (error: any) {
+                        setStatus(`Reject échoué: ${String(error?.message || error)}`, 'err');
+                    }
+                }
+            );
+            return;
+        }
 
         dispatch(item.event);
         if (item.followUpEvent) {
             dispatch(item.followUpEvent);
         }
-    }, [refreshApprovals, refreshDiff, refreshEditorNodes, refreshPipelines, refreshRuns, refreshTriggers, refreshHistory, setStatus]);
+    }, [
+        approvalService,
+        jumpToBoundary,
+        openConfirm,
+        openCurrentTabFilter,
+        refreshApprovals,
+        clearCurrentTabFilter,
+        refreshCurrentTab,
+        refreshDiff,
+        refreshEditorNodes,
+        refreshHistory,
+        refreshPipelines,
+        refreshRuns,
+        refreshTriggers,
+        runtime,
+        selectedApproval,
+        selectedPipeline,
+        selectedRunId,
+        setStatus,
+        startDetachedPipeline,
+        supervisor,
+        triggerService
+    ]);
 
     const moveByFocus = useCallback((delta: number) => {
         if (ui.activeTab === 'run') {
             if (ui.focusZone === 'left') {
-                dispatch({ type: 'move_index', key: 'run', delta, max: runs.length });
+                const next = moveWithinView(runViewIndices, ui.selectedRunIndex, delta);
+                if (next !== undefined) {
+                    dispatch({ type: 'select_index', key: 'run', index: next, max: runs.length });
+                }
                 return;
             }
             if (ui.focusZone === 'center') {
@@ -387,29 +826,65 @@ function ModernApp(props: ModernAppProps): JSX.Element {
         }
 
         if (ui.activeTab === 'pipelines') {
-            dispatch({ type: 'move_index', key: 'pipeline', delta, max: pipelines.length });
+            const next = moveWithinView(pipelineViewIndices, ui.selectedPipelineIndex, delta);
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'pipeline', index: next, max: pipelines.length });
+            }
             return;
         }
 
         if (ui.activeTab === 'editor') {
-            dispatch({ type: 'move_index', key: 'editor', delta, max: editorNodes.length });
+            const next = moveWithinView(editorViewIndices, ui.selectedEditorNodeIndex, delta);
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'editor', index: next, max: editorNodes.length });
+            }
             return;
         }
 
         if (ui.activeTab === 'history') {
-            dispatch({ type: 'move_index', key: 'history', delta, max: historyRows.length });
+            const next = moveWithinView(historyViewIndices, ui.selectedHistoryIndex, delta);
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'history', index: next, max: historyRows.length });
+            }
             return;
         }
 
         if (ui.activeTab === 'triggers') {
-            dispatch({ type: 'move_index', key: 'trigger', delta, max: triggerRows.length });
+            const next = moveWithinView(triggerViewIndices, ui.selectedTriggerIndex, delta);
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'trigger', index: next, max: triggerRows.length });
+            }
             return;
         }
 
         if (ui.activeTab === 'hitl') {
-            dispatch({ type: 'move_index', key: 'approval', delta, max: approvals.length });
+            const next = moveWithinView(approvalViewIndices, ui.selectedApprovalIndex, delta);
+            if (next !== undefined) {
+                dispatch({ type: 'select_index', key: 'approval', index: next, max: approvals.length });
+            }
         }
-    }, [approvals.length, editorNodes.length, historyRows.length, pipelines.length, runs.length, triggerRows.length, ui.activeTab, ui.focusZone]);
+    }, [
+        approvalViewIndices,
+        approvals.length,
+        editorNodes.length,
+        editorViewIndices,
+        historyRows.length,
+        historyViewIndices,
+        pipelineViewIndices,
+        pipelines.length,
+        runViewIndices,
+        runs.length,
+        triggerRows.length,
+        triggerViewIndices,
+        ui.activeTab,
+        ui.focusZone,
+        ui.selectedApprovalIndex,
+        ui.selectedEditorNodeIndex,
+        ui.selectedHistoryIndex,
+        ui.selectedPipelineIndex,
+        ui.selectedRunIndex,
+        ui.selectedTriggerIndex
+    ]);
 
     useEffect(() => {
         refreshRuns();
@@ -422,6 +897,48 @@ function ModernApp(props: ModernAppProps): JSX.Element {
         // Intentionally bootstrap once; periodic scheduler handles subsequent refresh cycles.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    useEffect(() => {
+        if (runViewIndices.length === 0) return;
+        if (!runViewIndices.includes(ui.selectedRunIndex)) {
+            dispatch({ type: 'select_index', key: 'run', index: runViewIndices[0], max: runs.length });
+        }
+    }, [runViewIndices, runs.length, ui.selectedRunIndex]);
+
+    useEffect(() => {
+        if (pipelineViewIndices.length === 0) return;
+        if (!pipelineViewIndices.includes(ui.selectedPipelineIndex)) {
+            dispatch({ type: 'select_index', key: 'pipeline', index: pipelineViewIndices[0], max: pipelines.length });
+        }
+    }, [pipelineViewIndices, pipelines.length, ui.selectedPipelineIndex]);
+
+    useEffect(() => {
+        if (editorViewIndices.length === 0) return;
+        if (!editorViewIndices.includes(ui.selectedEditorNodeIndex)) {
+            dispatch({ type: 'select_index', key: 'editor', index: editorViewIndices[0], max: editorNodes.length });
+        }
+    }, [editorNodes.length, editorViewIndices, ui.selectedEditorNodeIndex]);
+
+    useEffect(() => {
+        if (historyViewIndices.length === 0) return;
+        if (!historyViewIndices.includes(ui.selectedHistoryIndex)) {
+            dispatch({ type: 'select_index', key: 'history', index: historyViewIndices[0], max: historyRows.length });
+        }
+    }, [historyRows.length, historyViewIndices, ui.selectedHistoryIndex]);
+
+    useEffect(() => {
+        if (triggerViewIndices.length === 0) return;
+        if (!triggerViewIndices.includes(ui.selectedTriggerIndex)) {
+            dispatch({ type: 'select_index', key: 'trigger', index: triggerViewIndices[0], max: triggerRows.length });
+        }
+    }, [triggerRows.length, triggerViewIndices, ui.selectedTriggerIndex]);
+
+    useEffect(() => {
+        if (approvalViewIndices.length === 0) return;
+        if (!approvalViewIndices.includes(ui.selectedApprovalIndex)) {
+            dispatch({ type: 'select_index', key: 'approval', index: approvalViewIndices[0], max: approvals.length });
+        }
+    }, [approvalViewIndices, approvals.length, ui.selectedApprovalIndex]);
 
     useEffect(() => {
         if (selectedRunId && selectedRunIdRef.current !== selectedRunId) {
@@ -502,6 +1019,54 @@ function ModernApp(props: ModernAppProps): JSX.Element {
                 category: 'action',
                 keywords: ['contrast', 'theme', 'accessibility'],
                 event: { type: 'set_status', text: 'Theme info', tone: 'info' }
+            },
+            {
+                id: 'action:refresh-current',
+                label: 'Refresh tab active',
+                hint: 'action',
+                category: 'action',
+                keywords: ['refresh', 'tab', 'current'],
+                event: { type: 'set_status', text: 'Refresh tab active', tone: 'info' }
+            },
+            {
+                id: 'action:jump-first',
+                label: 'Jump premier élément',
+                hint: 'action',
+                category: 'action',
+                keywords: ['jump', 'top', 'first', 'g'],
+                event: { type: 'set_status', text: 'Jump top', tone: 'info' }
+            },
+            {
+                id: 'action:jump-last',
+                label: 'Jump dernier élément',
+                hint: 'action',
+                category: 'action',
+                keywords: ['jump', 'bottom', 'last', 'G'],
+                event: { type: 'set_status', text: 'Jump bottom', tone: 'info' }
+            },
+            {
+                id: 'action:toggle-help',
+                label: 'Toggle aide contextuelle',
+                hint: 'action',
+                category: 'action',
+                keywords: ['help', 'shortcut', 'keyboard'],
+                event: { type: 'toggle_help' }
+            },
+            {
+                id: 'action:filter-current',
+                label: `Filtrer tab ${ui.activeTab}`,
+                hint: 'action',
+                category: 'action',
+                keywords: ['filter', 'search', 'tab', ui.activeTab],
+                event: { type: 'set_status', text: 'Ouvrir filtre tab', tone: 'info' }
+            },
+            {
+                id: 'action:filter-clear',
+                label: `Vider filtre tab ${ui.activeTab}`,
+                hint: 'action',
+                category: 'action',
+                keywords: ['filter', 'clear', 'reset', ui.activeTab],
+                event: { type: 'set_status', text: 'Vider filtre tab', tone: 'info' }
             }
         ];
 
@@ -514,6 +1079,126 @@ function ModernApp(props: ModernAppProps): JSX.Element {
                 keywords: [tab, 'tab', key],
                 event: { type: 'switch_tab', tab }
             });
+        }
+
+        if (selectedRunId) {
+            items.push(
+                {
+                    id: 'action:run-pause',
+                    label: `Pause run ${selectedRunId}`,
+                    hint: 'run',
+                    category: 'action',
+                    keywords: ['run', 'pause', selectedRunId],
+                    event: { type: 'set_status', text: 'Pause run', tone: 'warn' }
+                },
+                {
+                    id: 'action:run-resume',
+                    label: `Resume run ${selectedRunId}`,
+                    hint: 'run',
+                    category: 'action',
+                    keywords: ['run', 'resume', selectedRunId],
+                    event: { type: 'set_status', text: 'Resume run', tone: 'ok' }
+                },
+                {
+                    id: 'action:run-cancel',
+                    label: `Cancel run ${selectedRunId}`,
+                    hint: 'run',
+                    category: 'action',
+                    keywords: ['run', 'cancel', selectedRunId],
+                    event: { type: 'set_status', text: 'Cancel run', tone: 'warn' }
+                }
+            );
+        }
+
+        if (selectedPipeline) {
+            const pipelineLabel = String(selectedPipeline?.name || selectedPipeline?.path || 'selected_pipeline');
+            items.push(
+                {
+                    id: 'action:pipeline-run',
+                    label: `Run pipeline ${pipelineLabel}`,
+                    hint: 'pipeline',
+                    category: 'action',
+                    keywords: ['pipeline', 'run', pipelineLabel],
+                    event: { type: 'set_status', text: 'Run pipeline', tone: 'ok' }
+                },
+                {
+                    id: 'action:pipeline-dry',
+                    label: `Dry-run pipeline ${pipelineLabel}`,
+                    hint: 'pipeline',
+                    category: 'action',
+                    keywords: ['pipeline', 'dry-run', 'dry', pipelineLabel],
+                    event: { type: 'set_status', text: 'Dry-run pipeline', tone: 'info' }
+                },
+                {
+                    id: 'action:pipeline-open-editor',
+                    label: 'Ouvrir Editor du pipeline',
+                    hint: 'pipeline',
+                    category: 'action',
+                    keywords: ['pipeline', 'editor', 'open'],
+                    event: { type: 'switch_tab', tab: 'editor' }
+                }
+            );
+        }
+
+        if (ui.activeTab === 'diff') {
+            items.push({
+                id: 'action:diff-refresh',
+                label: 'Refresh diff',
+                hint: 'diff',
+                category: 'action',
+                keywords: ['diff', 'refresh'],
+                event: { type: 'set_status', text: 'Refresh diff', tone: 'info' }
+            });
+        }
+
+        if (ui.activeTab === 'triggers' || triggerRows.length > 0) {
+            items.push(
+                {
+                    id: 'action:trigger-start',
+                    label: 'Start triggers',
+                    hint: 'trigger',
+                    category: 'action',
+                    keywords: ['trigger', 'start', 'daemon'],
+                    event: { type: 'set_status', text: 'Start triggers', tone: 'ok' }
+                },
+                {
+                    id: 'action:trigger-stop',
+                    label: 'Stop triggers',
+                    hint: 'trigger',
+                    category: 'action',
+                    keywords: ['trigger', 'stop'],
+                    event: { type: 'set_status', text: 'Stop triggers', tone: 'warn' }
+                },
+                {
+                    id: 'action:trigger-refresh',
+                    label: 'Refresh triggers',
+                    hint: 'trigger',
+                    category: 'action',
+                    keywords: ['trigger', 'refresh'],
+                    event: { type: 'set_status', text: 'Refresh triggers', tone: 'info' }
+                }
+            );
+        }
+
+        if (selectedApproval) {
+            items.push(
+                {
+                    id: 'action:approval-approve',
+                    label: `Approve ${String(selectedApproval.id)}`,
+                    hint: 'hitl',
+                    category: 'action',
+                    keywords: ['approval', 'approve', String(selectedApproval.id)],
+                    event: { type: 'set_status', text: 'Approve', tone: 'ok' }
+                },
+                {
+                    id: 'action:approval-reject',
+                    label: `Reject ${String(selectedApproval.id)}`,
+                    hint: 'hitl',
+                    category: 'action',
+                    keywords: ['approval', 'reject', String(selectedApproval.id)],
+                    event: { type: 'set_status', text: 'Reject', tone: 'warn' }
+                }
+            );
         }
 
         runs.slice(0, 20).forEach((entry, index) => {
@@ -595,7 +1280,18 @@ function ModernApp(props: ModernAppProps): JSX.Element {
         });
 
         return items;
-    }, [approvals, editorNodes, historyRows, pipelines, runs, triggerRows]);
+    }, [
+        approvals,
+        editorNodes,
+        historyRows,
+        pipelines,
+        runs,
+        selectedApproval,
+        selectedPipeline,
+        selectedRunId,
+        triggerRows,
+        ui.activeTab
+    ]);
 
     const rankedPaletteItems = useMemo(() => {
         return rankPaletteItems(paletteItems, ui.palette.query, 30);
@@ -1057,6 +1753,12 @@ function ModernApp(props: ModernAppProps): JSX.Element {
             dispatch({ type: 'set_focus', zone: defaultFocusForTab(action.tab) });
             return;
         }
+        if (action.type === 'switch_tab_relative') {
+            const nextTab = shiftTab(ui.activeTab, action.delta);
+            dispatch({ type: 'switch_tab', tab: nextTab });
+            dispatch({ type: 'set_focus', zone: defaultFocusForTab(nextTab) });
+            return;
+        }
         if (action.type === 'cycle_focus') {
             dispatch({ type: 'cycle_focus', reverse: action.reverse });
             return;
@@ -1070,13 +1772,99 @@ function ModernApp(props: ModernAppProps): JSX.Element {
             return;
         }
 
+        if (input === '/') {
+            if (props.config.palette.enabled) {
+                dispatch({ type: 'open_palette' });
+            } else {
+                setStatus('Palette désactivée via config.', 'warn');
+            }
+            return;
+        }
+        if (input === 'R') {
+            refreshCurrentTab();
+            return;
+        }
+        if (input === 'g') {
+            jumpToBoundary('first');
+            return;
+        }
+        if (input === 'G') {
+            jumpToBoundary('last');
+            return;
+        }
+        if (input === 'F') {
+            openCurrentTabFilter();
+            return;
+        }
+        if (input === 'C') {
+            clearCurrentTabFilter();
+            return;
+        }
+
         applyTabAction(input, key);
     });
 
+    const tabActionHint = useMemo(() => {
+        if (ui.activeTab === 'run') return 'Run: p pause | r resume | c cancel | [ ] events | { } logs | F/C filtre';
+        if (ui.activeTab === 'pipelines') return 'Pipelines: Enter/r run | d dry-run | n new | x delete | e editor | F/C filtre';
+        if (ui.activeTab === 'editor') return 'Editor: a add | y yaml | v pipeline yaml | i/m/o/c fields | u/j reorder | F/C filtre';
+        if (ui.activeTab === 'history') return 'History: navigation + jump vers Diff via palette | F/C filtre';
+        if (ui.activeTab === 'diff') return 'Diff: f refresh | F/C filtre';
+        if (ui.activeTab === 'triggers') return 'Triggers: s start | x stop | f refresh | F/C filtre';
+        return 'HITL: a approve | r reject | F/C filtre';
+    }, [ui.activeTab]);
+
+    const compactStatusLine = useMemo(() => {
+        const max = Math.max(40, Math.min(stdoutColumns - 4, 120));
+        const text = [
+            `Tab:${ui.activeTab.toUpperCase()}`,
+            `Run:${selectedRunId || '-'}`,
+            `Pipe:${String(selectedPipeline?.name || '-')}`,
+            `Hist:${String(selectedHistory?.id || '-')}`,
+            `Trig:${String(selectedTrigger?.id || '-')}`,
+            `HITL:${String(selectedApproval?.id || '-')}`,
+            `Layout:${layoutMode}/${stdoutColumns}c`,
+            `Status:${toUpperSafe(selectedRun?.status || 'idle')}`
+        ].join(' | ');
+        return compactText(text, max);
+    }, [
+        layoutMode,
+        selectedApproval?.id,
+        selectedHistory?.id,
+        selectedPipeline?.name,
+        selectedRun?.status,
+        selectedRunId,
+        selectedTrigger?.id,
+        stdoutColumns,
+        ui.activeTab
+    ]);
+
     const shellHelp = useMemo(() => {
         const prompt = ui.prompt.open ? 'PROMPT' : ui.confirm.open ? 'CONFIRM' : ui.palette.open ? 'PALETTE' : 'NORMAL';
-        return `Mode ${prompt} | 1..7 tabs | Tab/Shift+Tab focus | Ctrl+K palette | ? help | editor: ${resolveEditorCommand()}`;
-    }, [ui.confirm.open, ui.palette.open, ui.prompt.open]);
+        const raw = `Mode ${prompt} | 1..7 tabs | Shift+←/→ tabs | Tab focus | Ctrl+K or / palette | editor:${resolveEditorCommand()}`;
+        return compactText(raw, Math.max(40, Math.min(stdoutColumns - 4, 110)));
+    }, [stdoutColumns, ui.confirm.open, ui.palette.open, ui.prompt.open]);
+
+    const topKeybinds = useMemo(() => {
+        return [
+            { key: '1..7', label: 'Tabs' },
+            { key: 'Shift+←/→', label: 'Tab +/-' },
+            { key: 'Tab', label: 'Focus' },
+            { key: 'Ctrl+K /', label: 'Palette' },
+            { key: 'F/C', label: 'Filtre' },
+            { key: 'R', label: 'Refresh' },
+            { key: 'g/G', label: 'Jump' },
+            { key: '?', label: 'Aide' }
+        ];
+    }, []);
+
+    const footerKeybinds = useMemo(() => {
+        return [
+            { key: 'p/r/c', label: 'Run control' },
+            { key: 's/x/f', label: 'Triggers' },
+            { key: 'a/r', label: 'HITL' }
+        ];
+    }, []);
 
     return (
         <Box flexDirection="column" paddingX={1}>
@@ -1088,14 +1876,20 @@ function ModernApp(props: ModernAppProps): JSX.Element {
                 uiVersion={`v2 (${props.config.keymap.profile})`}
             />
 
-            <TabBar activeTab={ui.activeTab} theme={theme} />
+            <TabBar activeTab={ui.activeTab} theme={theme} counts={tabCounts} />
+            <KeybindStrip
+                theme={theme}
+                title="Raccourcis essentiels"
+                items={topKeybinds}
+            />
 
             {ui.activeTab === 'run' && (
                 <RunScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
-                    runs={runs}
-                    selectedRunIndex={ui.selectedRunIndex}
+                    runs={runList}
+                    selectedRunIndex={selectedRunVisibleIndex}
                     visibleEvents={visibleEvents}
                     visibleLogs={visibleLogs}
                     eventTotal={eventLines.length}
@@ -1104,62 +1898,75 @@ function ModernApp(props: ModernAppProps): JSX.Element {
                     logMax={props.config.maxLogs}
                     eventOffset={ui.eventOffset}
                     logOffset={ui.logOffset}
+                    filterQuery={filters.run}
                 />
             )}
 
             {ui.activeTab === 'pipelines' && (
                 <PipelinesScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
-                    pipelines={pipelines}
-                    selectedPipelineIndex={ui.selectedPipelineIndex}
+                    pipelines={pipelineList}
+                    selectedPipelineIndex={selectedPipelineVisibleIndex}
+                    filterQuery={filters.pipelines}
                 />
             )}
 
             {ui.activeTab === 'editor' && (
                 <EditorScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
                     pipelinePath={String(selectedPipeline?.path || '')}
-                    nodes={editorNodes}
-                    selectedNodeIndex={ui.selectedEditorNodeIndex}
+                    nodes={editorList}
+                    selectedNodeIndex={selectedEditorVisibleIndex}
                     yamlPreview={yamlPreview}
+                    filterQuery={filters.editor}
                 />
             )}
 
             {ui.activeTab === 'history' && (
                 <HistoryScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
-                    historyRows={historyRows}
-                    selectedHistoryIndex={ui.selectedHistoryIndex}
+                    historyRows={historyList}
+                    selectedHistoryIndex={selectedHistoryVisibleIndex}
+                    filterQuery={filters.history}
                 />
             )}
 
             {ui.activeTab === 'diff' && (
                 <DiffScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
                     source={diffSource}
-                    lines={diffLines}
+                    lines={diffViewLines}
+                    filterQuery={filters.diff}
                 />
             )}
 
             {ui.activeTab === 'triggers' && (
                 <TriggersScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
-                    triggerRows={triggerRows}
-                    selectedTriggerIndex={ui.selectedTriggerIndex}
+                    triggerRows={triggerList}
+                    selectedTriggerIndex={selectedTriggerVisibleIndex}
+                    filterQuery={filters.triggers}
                 />
             )}
 
             {ui.activeTab === 'hitl' && (
                 <HitlScreen
                     theme={theme}
+                    layoutMode={layoutMode}
                     focusZone={ui.focusZone}
-                    approvals={approvals}
-                    selectedApprovalIndex={ui.selectedApprovalIndex}
+                    approvals={approvalList}
+                    selectedApprovalIndex={selectedApprovalVisibleIndex}
+                    filterQuery={filters.hitl}
                 />
             )}
 
@@ -1167,12 +1974,13 @@ function ModernApp(props: ModernAppProps): JSX.Element {
                 theme={theme}
                 statusText={`${theme.symbols.bullet} ${ui.status.text}`}
                 tone={ui.status.tone}
-                helpHint={shellHelp}
+                helpHint={`${shellHelp} | ${tabActionHint}`}
+                keybinds={footerKeybinds}
             />
 
             <Box marginTop={1}>
                 <Text color={theme.colors.muted}>
-                    Run actif: {selectedRunId || '-'} {theme.symbols.separator} Pipeline: {String(selectedPipeline?.name || '-')} {theme.symbols.separator} History: {String(selectedHistory?.id || '-')} {theme.symbols.separator} Trigger: {String(selectedTrigger?.id || '-')} {theme.symbols.separator} HITL: {String(selectedApproval?.id || '-')} {theme.symbols.separator} Heure: {formatTime(Date.now())} {theme.symbols.separator} Status: {toUpperSafe(selectedRun?.status || 'idle')}
+                    {compactStatusLine} {theme.symbols.separator} Heure:{formatTime(Date.now())}
                 </Text>
             </Box>
 
@@ -1205,7 +2013,7 @@ function ModernApp(props: ModernAppProps): JSX.Element {
             )}
 
             <Box marginTop={1}>
-                <Text color={theme.colors.muted}>Config: intentRouter.tui.ui.version | theme.highContrast | keymap.profile | palette.enabled | palette.trigger</Text>
+                <Text color={theme.colors.muted}>Config: intentRouter.tui.ui.version | theme.highContrast | keymap.profile | palette.enabled | palette.trigger | filtres tab via F/C</Text>
             </Box>
         </Box>
     );

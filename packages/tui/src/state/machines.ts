@@ -305,3 +305,10 @@ export const TAB_TITLES: Record<TabId, string> = {
     triggers: 'Triggers',
     hitl: 'HITL'
 };
+
+export function shiftTab(current: TabId, delta: -1 | 1): TabId {
+    const index = TAB_ORDER.indexOf(current);
+    const safeIndex = index >= 0 ? index : 0;
+    const next = (safeIndex + delta + TAB_ORDER.length) % TAB_ORDER.length;
+    return TAB_ORDER[next];
+}

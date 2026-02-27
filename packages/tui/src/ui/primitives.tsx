@@ -67,22 +67,60 @@ const TAB_ORDER: Array<{ id: TabId; label: string; key: string }> = [
     { id: 'hitl', label: 'HITL', key: '7' }
 ];
 
-export function TabBar(props: { activeTab: TabId; theme: TuiTheme }): JSX.Element {
+type TabCount = {
+    visible: number;
+    total: number;
+    filtered: boolean;
+};
+
+function formatTabLabel(baseLabel: string, count?: TabCount): string {
+    if (!count) return baseLabel;
+    if (count.filtered) return `${baseLabel} ${count.visible}/${count.total}`;
+    return `${baseLabel} ${count.total}`;
+}
+
+export function TabBar(props: { activeTab: TabId; theme: TuiTheme; counts?: Partial<Record<TabId, TabCount>> }): JSX.Element {
     return (
-        <Box borderStyle="round" borderColor={props.theme.colors.panelBorder} paddingX={1} marginTop={1}>
+        <Box borderStyle="round" borderColor={props.theme.colors.panelBorder} paddingX={1} marginTop={1} flexDirection="column">
+            <Box>
             {TAB_ORDER.map((entry) => {
                 const active = entry.id === props.activeTab;
+                const count = active ? props.counts?.[entry.id] : undefined;
                 return (
                     <Box key={entry.id} marginRight={1}>
                         <Text
                             color={active ? props.theme.colors.tabActiveFg : props.theme.colors.accent}
                             backgroundColor={active ? props.theme.colors.tabActiveBg : undefined}
                         >
-                            {entry.key} {entry.label}
+                            {entry.key} {formatTabLabel(entry.label, count)}
                         </Text>
                     </Box>
                 );
             })}
+            </Box>
+            <Text color={props.theme.colors.muted}>
+                Active: {props.activeTab.toUpperCase()} {props.theme.symbols.separator} Shift+Left/Right: switch tab
+            </Text>
+        </Box>
+    );
+}
+
+export function KeybindStrip(props: {
+    theme: TuiTheme;
+    title: string;
+    items: Array<{ key: string; label: string }>;
+}): JSX.Element {
+    return (
+        <Box borderStyle="round" borderColor={props.theme.colors.panelBorder} paddingX={1} marginTop={1} flexDirection="column">
+            <Text color={props.theme.colors.accent}>{props.title}</Text>
+            <Box marginTop={0}>
+                {props.items.map((entry) => (
+                    <Box key={`${entry.key}:${entry.label}`} marginRight={2}>
+                        <Text color={props.theme.colors.tabActiveFg} backgroundColor={props.theme.colors.tabActiveBg}> {entry.key} </Text>
+                        <Text color={props.theme.colors.muted}> {entry.label}</Text>
+                    </Box>
+                ))}
+            </Box>
         </Box>
     );
 }
@@ -123,11 +161,19 @@ export function Footer(props: {
     statusText: string;
     tone: Tone;
     helpHint: string;
+    keybinds: Array<{ key: string; label: string }>;
 }): JSX.Element {
     return (
-        <Box borderStyle="round" borderColor={props.theme.colors.panelBorder} paddingX={1} marginTop={1}>
+        <Box borderStyle="round" borderColor={props.theme.colors.panelBorder} paddingX={1} marginTop={1} flexDirection="column">
             <Text color={toneColor(props.theme, props.tone)}>{props.statusText}</Text>
-            <Text> </Text>
+            <Box marginTop={0}>
+                {props.keybinds.map((entry) => (
+                    <Box key={`${entry.key}:${entry.label}`} marginRight={1}>
+                        <Text color={props.theme.colors.tabActiveFg} backgroundColor={props.theme.colors.tabActiveBg}> {entry.key} </Text>
+                        <Text color={props.theme.colors.muted}> {entry.label}</Text>
+                    </Box>
+                ))}
+            </Box>
             <Text color={props.theme.colors.muted}>{props.helpHint}</Text>
         </Box>
     );
