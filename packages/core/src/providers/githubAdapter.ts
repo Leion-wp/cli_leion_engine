@@ -1,3 +1,4 @@
+import { githubCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import * as cp from 'child_process';
 import * as path from 'path';
@@ -63,63 +64,7 @@ export function validateGitBranchRef(value: string, label: 'head' | 'base'): str
 }
 
 export function registerGitHubProvider(_context: vscode.ExtensionContext) {
-    registerCapabilities({
-        provider: 'github',
-        type: 'vscode',
-        capabilities: [
-            {
-                capability: 'github.openPr',
-                command: 'intentRouter.internal.githubOpenPr',
-                description: 'Open a GitHub Pull Request with gh CLI',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'head', type: 'string', description: 'Head branch', required: true },
-                    { name: 'base', type: 'string', description: 'Base branch', required: true },
-                    { name: 'title', type: 'string', description: 'PR title', required: true },
-                    { name: 'body', type: 'string', description: 'PR body markdown' },
-                    { name: 'bodyFile', type: 'path', description: 'PR body markdown file path' },
-                    { name: 'cwd', type: 'path', description: 'Repository working directory', default: '${workspaceRoot}' }
-                ]
-            },
-            {
-                capability: 'github.prChecks',
-                command: 'intentRouter.internal.githubPrChecks',
-                description: 'Fetch checks summary for a PR with gh CLI',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'url', type: 'string', description: 'PR URL (preferred)' },
-                    { name: 'number', type: 'string', description: 'PR number (fallback)' },
-                    { name: 'repo', type: 'string', description: 'repo owner/name (fallback)' },
-                    { name: 'cwd', type: 'path', description: 'Repository working directory', default: '${workspaceRoot}' }
-                ]
-            },
-            {
-                capability: 'github.prRerunFailedChecks',
-                command: 'intentRouter.internal.githubPrRerunFailedChecks',
-                description: 'Re-run failed checks for a PR with gh CLI',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'url', type: 'string', description: 'PR URL (preferred)' },
-                    { name: 'number', type: 'string', description: 'PR number (fallback)' },
-                    { name: 'repo', type: 'string', description: 'repo owner/name (fallback)' },
-                    { name: 'cwd', type: 'path', description: 'Repository working directory', default: '${workspaceRoot}' }
-                ]
-            },
-            {
-                capability: 'github.prComment',
-                command: 'intentRouter.internal.githubPrComment',
-                description: 'Post a comment on a PR with gh CLI',
-                determinism: 'interactive',
-                args: [
-                    { name: 'url', type: 'string', description: 'PR URL (preferred)' },
-                    { name: 'number', type: 'string', description: 'PR number (fallback)' },
-                    { name: 'repo', type: 'string', description: 'repo owner/name (fallback)' },
-                    { name: 'body', type: 'string', description: 'Comment body', required: true },
-                    { name: 'cwd', type: 'path', description: 'Repository working directory', default: '${workspaceRoot}' }
-                ]
-            }
-        ]
-    });
+    registerCapabilities(githubCapabilities);
 }
 
 function normalizeExecutionCwd(rawCwd: any): string {

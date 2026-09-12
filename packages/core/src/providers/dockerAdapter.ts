@@ -1,3 +1,4 @@
+import { dockerCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import { registerCapabilities } from '../registry';
 
@@ -8,33 +9,8 @@ export function registerDockerProvider(context: vscode.ExtensionContext) {
 }
 
 function doRegister() {
-    registerCapabilities({
-        provider: 'docker',
-        type: 'vscode',
-        capabilities: [
-            {
-                capability: 'docker.build',
-                command: 'vscode-docker.configure', // Best approximation for build workflow in V1
-                description: 'Build a Docker image',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'tag', type: 'string', description: 'Image tag', required: true },
-                    { name: 'path', type: 'path', description: 'Context path', default: '.' }
-                ]
-            },
-            {
-                capability: 'docker.run',
-                command: 'vscode-docker.containers.start',
-                description: 'Run a Docker container',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'image', type: 'string', description: 'Image ID or name', required: true },
-                    { name: 'detach', type: 'boolean', description: 'Run in background', default: true }
-                ]
-            }
-        ]
-    });
-    console.log('[Intent Router] Registered Docker provider capabilities.');
+    registerCapabilities(dockerCapabilities);
+    console.error('[Intent Router] Registered Docker provider capabilities.');
 }
 
 export const dockerTemplates: Record<string, any> = {
