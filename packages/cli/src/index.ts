@@ -2,7 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
-import * as readline from 'readline/promises';
+import { askInput, askChoice } from './interaction';
 
 const core: any = require('../../core/out/index');
 
@@ -92,43 +92,6 @@ async function readYamlArg(flags: Record<string, string | boolean>): Promise<str
         return content;
     }
     return value;
-}
-
-async function askInput(prompt: string, defaultValue?: string): Promise<string | undefined> {
-    if (!process.stdin.isTTY) {
-        return defaultValue;
-    }
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    try {
-        const suffix = defaultValue !== undefined ? ` [default: ${defaultValue}]` : '';
-        const answer = await rl.question(`${prompt}${suffix}: `);
-        const trimmed = String(answer || '').trim();
-        if (!trimmed && defaultValue !== undefined) {
-            return defaultValue;
-        }
-        return trimmed || undefined;
-    } finally {
-        rl.close();
-    }
-}
-
-async function askChoice(title: string, options: string[], defaultIndex = 0): Promise<string | undefined> {
-    if (!options.length) {
-        return undefined;
-    }
-    if (!process.stdin.isTTY) {
-        return options[Math.max(0, Math.min(defaultIndex, options.length - 1))];
-    }
-    console.log(title);
-    options.forEach((entry, index) => {
-        console.log(`  ${index + 1}. ${entry}`);
-    });
-    const selected = await askInput('Select option number', String(defaultIndex + 1));
-    const parsed = Number(selected || defaultIndex + 1);
-    if (!Number.isFinite(parsed) || parsed < 1 || parsed > options.length) {
-        return options[defaultIndex];
-    }
-    return options[Math.floor(parsed) - 1];
 }
 
 function createRuntime(workspaceRoot: string, verbose: boolean): any {

@@ -7,6 +7,7 @@ import { generateSecureToken, validateStrictShellArg, sanitizeShellArg, validate
 import { listPublicCapabilities } from './registry';
 import { Determinism } from './types';
 import { clearRunMemory, isRunMemoryEnabled, queryRunMemory, saveRunMemory } from './runMemoryStore';
+import { isInteractionRequired } from './interaction';
 
 export type PipelineFile = {
     name: string;
@@ -615,6 +616,7 @@ async function runPipeline(
     startStepId?: string,
     context?: PipelineRunContext
 ): Promise<PipelineRunResult> {
+    dryRun = dryRun || pipeline.meta?.dryRun === true;
     isCancelled = false;
     isPaused = false;
     let runStatus: 'success' | 'failure' | 'cancelled' = 'success';
@@ -654,10 +656,27 @@ async function runPipeline(
                 break;
             }
 
-            const step = pipeline.steps[currentIndex];
+            const originalStep = pipeline.steps[currentIndex];
+            const step: Intent = {
+                ...originalStep,
+                meta: {
+                    ...(originalStep.meta || {}),
+                    dryRun: dryRun || originalStep.meta?.dryRun === true
+                }
+            };
             const stepId = String(step?.id || '').trim();
             if (stepId && blockedStepIds.has(stepId)) { currentIndex++; continue; }
             const localIntentId = generateSecureToken(8);
+
+            // These runner-owned operations bypass routeIntent. In preview they
+            // must neither interact with the user nor access persistent memory.
+            if (step.meta?.dryRun && ['system.form', 'memory.save', 'memory.recall', 'memory.clear'].includes(step.intent)) {
+                pipelineEventBus.emit({ type: 'stepStart', runId, intentId: localIntentId, timestamp: Date.now(), description: step.description, intent: step.intent, index: currentIndex, stepId: step.id });
+                pipelineEventBus.emit({ type: 'stepLog', runId, intentId: localIntentId, stepId: step.id, text: `[dry-run] Skipped ${step.intent}; no input or memory operation performed.`, stream: 'stdout' });
+                pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, index: currentIndex, stepId: step.id });
+                currentIndex++;
+                continue;
+            }
 
             // SYSTEM.SETCWD
             if (step.intent === 'system.setCwd') {
@@ -887,6 +906,7 @@ async function runPipeline(
                                                 ...compiledTarget,
                                                 meta: {
                                                     ...(compiledTarget.meta || {}),
+                                                    dryRun: step.meta?.dryRun === true || compiledTarget.meta?.dryRun === true,
                                                     traceId: generateSecureToken(8),
                                                     runId,
                                                     stepId: compiledTarget.id,
@@ -903,6 +923,7 @@ async function runPipeline(
                                             }, sandboxPolicy.timeoutMs);
                                         })
                                     ]).catch((error) => {
+                                        if (isInteractionRequired(error)) throw error;
                                         lastErrorMessage = String(error?.message || error || 'Unknown loop graph_segment error');
                                         return false;
                                     });
@@ -973,6 +994,7 @@ async function runPipeline(
                         currentIndex++;
                         continue;
                     } catch (error: any) {
+                        if (isInteractionRequired(error)) throw error;
                         const message = String(error?.message || error || 'Loop graph_segment failed');
                         pipelineEventBus.emit({
                             type: 'stepLog',
@@ -1350,6 +1372,7 @@ async function runPipeline(
                     if (ok) break;
                     lastErrorMessage = `Step returned unsuccessful result for intent "${String(compiledStep.intent || '')}".`;
                 } catch (error: any) {
+                    if (isInteractionRequired(error)) throw error;
                     lastErrorMessage = String(error?.message || error || 'Unknown error');
                     pipelineEventBus.emit({
                         type: 'stepLog',
@@ -1378,14 +1401,14 @@ async function runPipeline(
             }
 
             // VARIABLE CAPTURE (Multi-value support)
-            if (ok && result && typeof result === 'object') {
+            if (!compiledStep.meta?.dryRun && ok && result && typeof result === 'object') {
                 const outContent = compiledStep.payload?.outputVar;
                 const outPath = compiledStep.payload?.outputVarPath;
                 const outChanges = compiledStep.payload?.outputVarChanges;
                 if (outContent && result.content !== undefined) variableCache.set(outContent, String(result.content));
                 if (outPath && result.path !== undefined) variableCache.set(outPath, String(result.path));
                 if (outChanges && result.changes !== undefined) variableCache.set(outChanges, JSON.stringify(result.changes));
-            } else if (ok) {
+            } else if (!compiledStep.meta?.dryRun && ok) {
                 const outVar = compiledStep.payload?.outputVar;
                 if (outVar) variableCache.set(outVar, String(result));
             }
@@ -1394,7 +1417,7 @@ async function runPipeline(
                     intent: String(compiledStep.intent || ''),
                     success: ok,
                     timestamp: Date.now(),
-                    output: normalizeValueForMemory(result),
+                    output: compiledStep.meta?.dryRun ? undefined : normalizeValueForMemory(result),
                     ...(!ok ? { error: buildCapturedError(compiledStep, finalAttempt, lastErrorMessage || 'Step failed.') } : {})
                 });
             }
@@ -1434,6 +1457,9 @@ async function runPipeline(
     } catch (e) {
         runStatus = 'failure';
         pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: Date.now(), success: false, status: 'failure' });
+        // Keep this condition visible across sub-pipelines and recovery routes.
+        // It requires a human; retry/continue policies cannot satisfy it.
+        if (isInteractionRequired(e)) throw e;
         return { runId, success: false, status: 'failure' };
     } finally {
         currentRunId = null;

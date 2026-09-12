@@ -2,6 +2,7 @@ import * as vscode from './ports/vscodeShim';
 import { Intent, ProfileConfig, ProviderAdapter, Resolution, UserMapping } from './types';
 import { resolveCapabilities } from './registry';
 import { generateSecureTraceId } from './security';
+import { isInteractionRequired } from './interaction';
 
 let cachedLogLevel: 'error' | 'warn' | 'info' | 'debug' | undefined;
 
@@ -25,7 +26,9 @@ export async function routeIntent(intent: Intent, variableCache?: Map<string, st
                 ...childStep,
                 meta: {
                     ...(normalized.meta ?? {}),
-                    ...(childStep.meta ?? {})
+                    ...(childStep.meta ?? {}),
+                    // A child may opt into preview, but cannot undo its parent's preview.
+                    dryRun: normalized.meta?.dryRun === true || childStep.meta?.dryRun === true
                 }
             };
 
@@ -212,10 +215,18 @@ async function executeResolution(
 
     if (intent.description) log(output, intent, minLevel, 'info', 'IR014', `[STEP] ${intent.description}`);
 
+    // Stop before provider payload mapping and input resolution as well as invocation.
+    // A preview must not request human input or produce provider output.
+    if (meta.dryRun) {
+        log(output, intent, minLevel, 'info', 'IR007', `step=preview command=${entry.command} dryRun=true`);
+        return true;
+    }
+
     let payload = entry.mapPayload ? entry.mapPayload(intent) : intent.payload;
     try {
         payload = await resolveVariables(payload, variableCache);
     } catch (error) {
+         if (isInteractionRequired(error)) throw error;
          vscode.window.showWarningMessage('Pipeline cancelled by user.');
          return false;
     }
@@ -238,12 +249,11 @@ async function executeResolution(
 
     log(output, intent, minLevel, 'info', 'IR007', `step=execute command=${entry.command} dryRun=${meta.dryRun}`);
 
-    if (meta.dryRun) return true;
-
     try {
         const result = await adapter.invoke(entry, payload, intent);
         return result !== undefined ? result : true;
     } catch (error) {
+        if (isInteractionRequired(error)) throw error;
         log(output, intent, minLevel, 'error', 'IR008', `step=execute error command=${entry.command}`);
         vscode.window.showErrorMessage(`Failed to execute ${entry.command}: ${error}`);
         return false;
