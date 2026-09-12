@@ -17,7 +17,8 @@ function requireInteractiveTerminal(prompt: string): void {
 
 export async function askInput(prompt: string, defaultValue?: string): Promise<string | undefined> {
     requireInteractiveTerminal(prompt);
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const output = process.argv.some((arg) => arg === '--json' || arg === '--json=true') ? process.stderr : process.stdout;
+    const rl = readline.createInterface({ input: process.stdin, output });
     try {
         const suffix = defaultValue !== undefined ? ` [default: ${defaultValue}]` : '';
         const answer = await rl.question(`${prompt}${suffix}: `);

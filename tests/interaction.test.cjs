@@ -97,11 +97,10 @@ test('compiled CLI dry-run succeeds without input or effectful dispatch', (t) =>
     step('provider', 'terminal.run', { command: '${input:never prompt}' }),
     step('child', 'system.subPipeline', { pipelinePath: 'not-opened.intent.json', dryRunChild: false })
   ]);
-  const result = f.run(['run_pipeline', '--pipeline', 'proof', '--dry_run']);
+  const result = f.run(['run_pipeline', '--pipeline', 'proof', '--dry_run', '--json', '--verbose']);
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr);
-  // This baseline CLI prints provider-registration messages before its JSON.
-  assert.equal(JSON.parse(result.stdout.slice(result.stdout.lastIndexOf('\n{') + 1)).status, 'success');
+  assert.equal(JSON.parse(result.stdout).status, 'success');
   assert.doesNotMatch(result.stderr, /PROVIDER_SENTINEL_CALLED|INTERACTION_REQUIRED/);
 });
 
@@ -112,11 +111,12 @@ test('compiled CLI refuses a headless approval even with recovery configured', (
     }),
     step('effect', 'terminal.run', { command: 'must-never-execute' })
   ]);
-  const result = f.run(['run_pipeline', '--pipeline', 'proof']);
+  const result = f.run(['run_pipeline', '--pipeline', 'proof', '--json']);
   assert.equal(result.error, undefined);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /INTERACTION_REQUIRED/);
   assert.doesNotMatch(result.stderr, /PROVIDER_SENTINEL_CALLED/);
+  assert.equal(JSON.parse(result.stdout).diagnostics[0].code, 'INTERACTION_REQUIRED');
 });
 
 test('compiled CLI refuses required form text, select and checkbox fields without TTY', (t) => {

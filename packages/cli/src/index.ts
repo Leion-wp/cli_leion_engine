@@ -2,8 +2,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
+import { format } from 'util';
 import { askInput, askChoice } from './interaction';
 
+const cliArgs = parseArgs(process.argv.slice(2));
+const jsonMode = asBool(cliArgs.flags.json);
+if (jsonMode) {
+    const diagnostic = (...args: any[]) => { process.stderr.write(`${format(...args)}\n`); };
+    console.log = diagnostic;
+    console.info = diagnostic;
+    console.debug = diagnostic;
+}
 const core: any = require('../../core/out/index');
 
 type ParsedArgs = {
@@ -19,7 +28,12 @@ function parseArgs(argv: string[]): ParsedArgs {
     for (let index = 0; index < argv.length; index += 1) {
         const token = argv[index];
         if (token.startsWith('--')) {
-            const key = token.slice(2);
+            const equals = token.indexOf('=');
+            const key = equals === -1 ? token.slice(2) : token.slice(2, equals);
+            if (equals !== -1) {
+                flags[key] = token.slice(equals + 1);
+                continue;
+            }
             const next = argv[index + 1];
             if (next !== undefined && !next.startsWith('--')) {
                 flags[key] = next;
@@ -104,11 +118,11 @@ function createRuntime(workspaceRoot: string, verbose: boolean): any {
             event_sink: {
                 log: (channel: string, line: string) => {
                     if (verbose) {
-                        process.stdout.write(`[${channel}] ${line}\n`);
+                        process.stderr.write(`[${channel}] ${line}\n`);
                     }
                 },
                 info: (message: string) => {
-                    if (verbose) process.stdout.write(`[info] ${message}\n`);
+                    if (verbose) process.stderr.write(`[info] ${message}\n`);
                 },
                 warn: (message: string) => {
                     process.stderr.write(`[warn] ${message}\n`);
@@ -133,7 +147,7 @@ function createRuntime(workspaceRoot: string, verbose: boolean): any {
                 },
                 showInformationMessage: async (message: string, _options?: any, ...items: any[]) => {
                     if (!items.length) {
-                        if (verbose) process.stdout.write(`${message}\n`);
+                        if (verbose) process.stderr.write(`${message}\n`);
                         return undefined;
                     }
                     return await askChoice(message, items.map((entry) => String(entry)), 0);
@@ -514,6 +528,9 @@ function printHelp(): void {
         'Leion Roots CLI',
         '',
         'Commands:',
+        '  runtime_describe [--json]',
+        '  catalog [--section capabilities] [--json]',
+        '  validate_pipeline --pipeline <path|name> --workspace <root> [--json]',
         '  create_pipeline --name <name> [--description "..."] [--verbose]',
         '  delete_pipeline --pipeline <path|name> [--verbose]',
         '  edit_pipeline --pipeline <path|name> --yaml <payload|-> [--verbose]',
@@ -529,11 +546,13 @@ function printHelp(): void {
         '  history_clear [--verbose]',
         '  triggers_serve [--verbose]'
     ];
-    process.stdout.write(`${lines.join('\n')}\n`);
+    process.stdout.write(jsonMode
+        ? `${JSON.stringify({ ok: true, protocolVersion: core.PROTOCOL_VERSION, help: lines }, null, 2)}\n`
+        : `${lines.join('\n')}\n`);
 }
 
 async function main(): Promise<void> {
-    const parsed = parseArgs(process.argv.slice(2));
+    const parsed = cliArgs;
     if (!parsed.command || parsed.command === 'help' || parsed.command === '--help') {
         printHelp();
         return;
@@ -547,6 +566,22 @@ async function main(): Promise<void> {
     const workspaceRoot = getWorkspaceRoot(parsed.flags);
 
     switch (parsed.command) {
+        case 'runtime_describe':
+        case 'catalog': {
+            if (parsed.command === 'catalog' && parsed.flags.section !== undefined && parsed.flags.section !== 'capabilities') {
+                throw Object.assign(new Error('catalog supports only --section capabilities in protocol version 1.'), { code: 'UNSUPPORTED_SECTION' });
+            }
+            const response = core.describeRuntime(String(require('../package.json').version));
+            process.stdout.write(`${JSON.stringify(response, null, 2)}\n`);
+            return;
+        }
+        case 'validate_pipeline': {
+            const reference = typeof parsed.flags.pipeline === 'string' ? parsed.flags.pipeline : '';
+            const result = core.validatePipelineFile(workspaceRoot, reference);
+            process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+            if (!result.valid) process.exitCode = 1;
+            return;
+        }
         case 'create_pipeline':
             await handleCreatePipeline(workspaceRoot, parsed.flags);
             return;
@@ -587,6 +622,7 @@ async function main(): Promise<void> {
             await handleHistoryClear(workspaceRoot, parsed.flags);
             return;
         case 'triggers_serve':
+            if (jsonMode) throw Object.assign(new Error('triggers_serve does not support single-document JSON mode.'), { code: 'UNSUPPORTED_JSON_COMMAND' });
             await handleTriggersServe(workspaceRoot, parsed.flags);
             return;
         default:
@@ -603,5 +639,10 @@ main()
     })
     .catch((error: any) => {
         process.stderr.write(`${String(error?.message || error)}\n`);
+        if (jsonMode) process.stdout.write(`${JSON.stringify({
+            ok: false,
+            protocolVersion: core.PROTOCOL_VERSION,
+            diagnostics: [{ code: String(error?.code || 'COMMAND_FAILED'), severity: 'error', path: '', message: String(error?.message || error) }]
+        }, null, 2)}\n`);
         process.exit(1);
     });

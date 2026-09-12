@@ -1,27 +1,10 @@
+import { httpCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import { pipelineEventBus } from '../eventBus';
 import { registerCapabilities } from '../registry';
 
 export function registerHttpProvider(context: vscode.ExtensionContext) {
-    registerCapabilities({
-        provider: 'http',
-        type: 'vscode',
-        capabilities: [
-            {
-                capability: 'http.request',
-                command: 'intentRouter.internal.httpRequest',
-                description: 'Make an HTTP request to an external API',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'url', type: 'string', description: 'Target URL', required: true },
-                    { name: 'method', type: 'enum', options: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP Method', default: 'GET' },
-                    { name: 'headers', type: 'string', description: 'JSON string of headers', default: '{}' },
-                    { name: 'body', type: 'string', description: 'Request body', default: '' },
-                    { name: 'outputVar', type: 'string', description: 'Variable to store response body' }
-                ]
-            }
-        ]
-    });
+    registerCapabilities(httpCapabilities);
 }
 
 export async function executeHttpCommand(args: any): Promise<any> {

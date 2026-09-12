@@ -1,3 +1,4 @@
+import { terminalCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import * as cp from 'child_process';
 import * as path from 'path';
@@ -11,23 +12,8 @@ export function registerTerminalProvider(context: vscode.ExtensionContext) {
 }
 
 function doRegister() {
-    registerCapabilities({
-        provider: 'terminal',
-        type: 'vscode',
-        capabilities: [
-            {
-                capability: 'terminal.run',
-                command: 'intentRouter.internal.terminalRun',
-                description: 'Run a shell command in the integrated terminal',
-                determinism: 'deterministic',
-                args: [
-                    { name: 'command', type: 'string', description: 'The shell command to execute', required: true },
-                    { name: 'cwd', type: 'path', description: 'Working directory', default: '.' }
-                ]
-            }
-        ]
-    });
-    console.log('[Intent Router] Registered Terminal provider capabilities.');
+    registerCapabilities(terminalCapabilities);
+    console.error('[Intent Router] Registered Terminal provider capabilities.');
 }
 
 export const terminalTemplates: Record<string, any> = {

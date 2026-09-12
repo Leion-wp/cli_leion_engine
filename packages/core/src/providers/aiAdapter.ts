@@ -1,3 +1,4 @@
+import { aiCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import * as cp from 'child_process';
 import * as path from 'path';
@@ -39,61 +40,7 @@ type TeamMember = {
 type SessionMemoryMode = 'runtime_only' | 'read_only' | 'write_only' | 'read_write';
 
 export function registerAiProvider(context: vscode.ExtensionContext) {
-    registerCapabilities({
-        provider: 'ai',
-        type: 'vscode',
-        capabilities: [
-            {
-                capability: 'ai.generate',
-                command: 'intentRouter.internal.aiGenerate',
-                description: 'Generate code or content using an AI agent',
-                determinism: 'interactive',
-                args: [
-                    { name: 'instruction', type: 'string', description: 'The prompt/instruction for the agent', required: true },
-                    { name: 'cwd', type: 'path', description: 'Working directory for CLI execution (inside workspace)' },
-                    { name: 'systemPrompt', type: 'string', description: 'Optional system-level constraints applied before instruction' },
-                    { name: 'contextFiles', type: 'string', description: 'Glob patterns for context files', default: [] },
-                    { name: 'agent', type: 'enum', options: ['gemini', 'codex'], description: 'The AI agent provider', default: 'gemini' },
-                    { name: 'model', type: 'string', description: 'Model name override' },
-                    { name: 'role', type: 'enum', options: ['brainstorm', 'prd', 'architect', 'backend', 'frontend', 'reviewer', 'qa'], description: 'Agent role profile', default: 'architect' },
-                    { name: 'instructionTemplate', type: 'string', description: 'Optional instruction template (supports ${instruction})' },
-                    { name: 'outputContract', type: 'enum', options: ['path_result', 'unified_diff'], description: 'Expected AI output contract', default: 'path_result' },
-                    { name: 'agentSpecFiles', type: 'string', description: 'Glob patterns for AGENTS.md / SKILL.md', default: [] },
-                    { name: 'outputVar', type: 'string', description: 'Variable to store result content' },
-                    { name: 'outputVarPath', type: 'string', description: 'Variable to store result path' },
-                    { name: 'outputVarChanges', type: 'string', description: 'Variable to store structured changes list' },
-                    { name: 'reasoningEffort', type: 'enum', options: ['low', 'medium', 'high', 'extra_high'], description: 'Reasoning depth (codex provider)', default: 'medium' },
-                    { name: 'sessionId', type: 'string', description: 'Optional persistent memory session id' },
-                    { name: 'sessionMode', type: 'enum', options: ['runtime_only', 'read_only', 'write_only', 'read_write'], description: 'Session memory mode', default: 'read_write' },
-                    { name: 'sessionResetBeforeRun', type: 'boolean', description: 'Reset session memory before running agent', default: false },
-                    { name: 'sessionRecallLimit', type: 'string', description: 'Max session memory entries injected into prompt', default: '12' }
-                ]
-            },
-            {
-                capability: 'ai.team',
-                command: 'intentRouter.internal.aiTeam',
-                description: 'Execute a team of AI agents in sequence',
-                determinism: 'interactive',
-                args: [
-                    { name: 'strategy', type: 'enum', options: ['sequential', 'reviewer_gate', 'vote'], description: 'Team strategy', default: 'sequential' },
-                    { name: 'cwd', type: 'path', description: 'Shared working directory for team members (inside workspace)' },
-                    { name: 'systemPrompt', type: 'string', description: 'Optional shared system-level constraints for team members' },
-                    { name: 'members', type: 'string', description: 'Team members configuration', required: true },
-                    { name: 'contextFiles', type: 'string', description: 'Shared context glob patterns', default: [] },
-                    { name: 'agentSpecFiles', type: 'string', description: 'Shared spec files glob patterns', default: [] },
-                    { name: 'outputContract', type: 'enum', options: ['path_result', 'unified_diff'], description: 'Expected AI output contract', default: 'path_result' },
-                    { name: 'outputVar', type: 'string', description: 'Variable to store final result content' },
-                    { name: 'outputVarPath', type: 'string', description: 'Variable to store final result path' },
-                    { name: 'outputVarChanges', type: 'string', description: 'Variable to store final structured changes list' },
-                    { name: 'sessionId', type: 'string', description: 'Optional persistent memory session id' },
-                    { name: 'sessionMode', type: 'enum', options: ['runtime_only', 'read_only', 'write_only', 'read_write'], description: 'Session memory mode', default: 'read_write' },
-                    { name: 'sessionResetBeforeRun', type: 'boolean', description: 'Reset session memory before running team', default: false },
-                    { name: 'sessionRecallLimit', type: 'string', description: 'Max session memory entries injected into prompt', default: '12' },
-                    { name: 'reviewerVoteWeight', type: 'string', description: 'Reviewer weight multiplier when strategy=vote', default: '2' }
-                ]
-            }
-        ]
-    });
+    registerCapabilities(aiCapabilities);
 }
 
 export async function executeAiCommand(args: any): Promise<any> {
