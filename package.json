@@ -10,6 +10,7 @@
     "build:core": "npm --prefix packages/core run build",
     "build:cli": "npm --prefix packages/cli run build",
     "build:all": "npm run build:core && npm run build:cli",
+    "test": "npm run build:cli && node --test tests/*.test.cjs",
     "cli": "node ./packages/cli/out/index.js"
   },
   "devDependencies": {

@@ -385,13 +385,6 @@ export const workspace = {
     }
 };
 
-function fallbackPick(items: any[]): any {
-    if (!Array.isArray(items) || items.length === 0) {
-        return undefined;
-    }
-    return items[0];
-}
-
 export const window = {
     terminals,
     activeTextEditor: undefined as any,
@@ -424,7 +417,7 @@ export const window = {
         if (hostPorts.interaction?.showQuickPick) {
             return await hostPorts.interaction.showQuickPick(items, options);
         }
-        return fallbackPick(items);
+        return undefined;
     },
 
     showInformationMessage: async (message: string, options?: any, ...items: any[]): Promise<any> => {
@@ -432,7 +425,7 @@ export const window = {
             return await hostPorts.interaction.showInformationMessage(message, options, ...items);
         }
         hostPorts.event_sink?.info?.(String(message || ''));
-        return items.length > 0 ? items[0] : undefined;
+        return undefined;
     },
 
     showWarningMessage: async (message: string, options?: any, ...items: any[]): Promise<any> => {
@@ -440,7 +433,7 @@ export const window = {
             return await hostPorts.interaction.showWarningMessage(message, options, ...items);
         }
         hostPorts.event_sink?.warn?.(String(message || ''));
-        return items.length > 0 ? items[0] : undefined;
+        return undefined;
     },
 
     showErrorMessage: async (message: string, options?: any, ...items: any[]): Promise<any> => {
@@ -448,7 +441,7 @@ export const window = {
             return await hostPorts.interaction.showErrorMessage(message, options, ...items);
         }
         hostPorts.event_sink?.error?.(String(message || ''));
-        return items.length > 0 ? items[0] : undefined;
+        return undefined;
     },
 
     createTerminal: (nameOrOptions: string | TerminalOptions): Terminal => {
