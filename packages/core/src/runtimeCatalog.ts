@@ -1,7 +1,8 @@
-import { builtinCapabilityRegistrations } from './builtinCapabilities';
+import { builtinCapabilityRegistrations, julesCapabilities } from './builtinCapabilities';
 import { policyCapabilities } from './policyCapability';
 import { CapabilityArgument } from './types';
 import { RUN_LOG_CONTRACT } from './runLogContract';
+import { isJulesConfigured } from './providers/julesAdapter';
 
 export const PROTOCOL_VERSION = '1';
 export const PROTOCOL_COMMANDS = [
@@ -50,7 +51,9 @@ const acceptedTypes: Record<string, Record<string, string[]>> = {
     },
     'ai.generate': { contextFiles: ['array'], agentSpecFiles: ['array'] },
     'ai.team': { members: ['array'], contextFiles: ['string', 'array'], agentSpecFiles: ['string', 'array'] },
-    'memory.save': { data: ['string', 'number', 'boolean', 'object', 'array', 'null'] }
+    'memory.save': { data: ['string', 'number', 'boolean', 'object', 'array', 'null'] },
+    'jules.sources.list': { pageSize: ['string', 'number'] },
+    'jules.activities.list': { pageSize: ['string', 'number'] }
 };
 
 function executionFacts(capability: string): Pick<CapabilityDescriptor, 'host' | 'executionMode' | 'risk' | 'requirements' | 'available'> {
@@ -83,6 +86,16 @@ function executionFacts(capability: string): Pick<CapabilityDescriptor, 'host' |
     if (capability === 'terminal.run') return { ...unknown, requirements: ['shell'] };
     if (capability === 'http.request') return { ...unknown, risk: 'network', requirements: ['network-access'] };
     if (capability.startsWith('github.')) return { ...unknown, requirements: ['gh-executable', 'github-authentication'] };
+    if (capability.startsWith('jules.')) {
+        const write = capability === 'jules.session.create' || capability === 'jules.plan.approve';
+        return {
+            host: 'cli',
+            executionMode: 'provider',
+            risk: write ? 'network-write' : 'read-only',
+            requirements: ['JULES_API_KEY', 'jules-account-access'],
+            available: true
+        };
+    }
     if (capability.startsWith('ai.')) return { ...unknown, requirements: ['configured-ai-cli'] };
     return { ...unknown, host: 'unknown', executionMode: 'unknown' };
 }
@@ -96,7 +109,10 @@ export function getRuntimeCapabilities(): CapabilityDescriptor[] {
         description: 'Pipeline container and inline composite intent supported by the runner/router',
         host: 'cli', executionMode: 'composite', risk: 'unknown', requirements: [], available: true
     }];
-    for (const registration of builtinCapabilityRegistrations) {
+    const registrations = isJulesConfigured()
+        ? [...builtinCapabilityRegistrations, julesCapabilities]
+        : builtinCapabilityRegistrations;
+    for (const registration of registrations) {
         for (const entry of registration.capabilities) {
             if (typeof entry === 'string') continue;
             descriptors.push({

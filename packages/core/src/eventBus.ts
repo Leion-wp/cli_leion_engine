@@ -45,6 +45,43 @@ export type PipelineEvent =
         base: string;
         title: string;
     }
+    | {
+        type: 'jules.session_created' | 'jules.session_observed';
+        runId?: string;
+        intentId?: string;
+        stepId?: string;
+        sessionId: string;
+        state: string;
+        sessionUrl?: string;
+    }
+    | {
+        type: 'jules.plan_approved';
+        runId?: string;
+        intentId?: string;
+        stepId?: string;
+        sessionId: string;
+        approved: true;
+    }
+    | {
+        type: 'jules.pull_request_observed';
+        runId?: string;
+        intentId?: string;
+        stepId?: string;
+        sessionId: string;
+        pullRequestUrl: string;
+        pullRequestOwner: string;
+        pullRequestRepository: string;
+        pullRequestNumber: number;
+    }
+    | {
+        type: 'jules.request_failed';
+        runId?: string;
+        intentId?: string;
+        stepId?: string;
+        operation: 'sources.list' | 'session.create' | 'session.get' | 'plan.approve' | 'activities.list';
+        code: string;
+        sessionId?: string;
+    }
     | { type: 'pipelineDecision'; nodeId?: string; runId?: string; approvedPaths?: string[]; decision: 'approve' | 'reject' }
     | { type: 'pipelineReviewOpenDiff'; nodeId?: string; runId?: string; path?: string }
     | { type: 'pipelinePause'; runId: string; timestamp: number }

@@ -117,7 +117,9 @@ the command subset of this protocol; it is distinct from the top-level array
 of intent descriptors. The real response fills that array from shared builtin
 provider declarations, plus the runner/router-owned `pipeline.run` container.
 It neither constructs a runtime nor loads workspace configuration, custom
-nodes, credentials, history, or mutable provider registrations.
+nodes, credential material, history, or mutable provider registrations. It
+checks only whether `JULES_API_KEY` is present and structurally valid so the
+optional Jules descriptors can be omitted when the provider is unconfigured.
 
 Each descriptor preserves `capability`, `provider`, `command`, `type`,
 `capabilityType`, `determinism`, and `args`. `host` and `executionMode` describe
@@ -290,6 +292,79 @@ scan bound returns `RUN_LOG_SCAN_LIMIT` instead of skipping bytes. Invalid
 cursors return `RUN_CURSOR_INVALID`; invalid limits return `RUN_LIMIT_INVALID`.
 The complete pretty-printed CLI JSON response, including its final newline, is
 bounded to 512 KiB.
+
+## Jules v1alpha provider
+
+The runtime integrates the official Jules REST API at the fixed production
+origin `https://jules.googleapis.com/v1alpha`. The API is an experimental alpha
+contract. Create an API key in the Jules web application and provide it only
+through `JULES_API_KEY`; the provider sends it in the `x-goog-api-key` header.
+It is never read from a pipeline payload or workspace configuration. The Jules
+intent descriptors appear in `runtime_describe` and `catalog` only while that
+environment variable contains a valid key. Advertised descriptors include
+`requirements: ["JULES_API_KEY", "jules-account-access"]`.
+This configuration check does not make a live request or prove that the key is
+authorized; the first provider request still fails closed if authentication or
+account access is unavailable.
+
+The implemented intent capabilities are:
+
+- `jules.sources.list`: optional `pageSize` (default 30, range 1-100) and the
+  opaque `pageToken`. Sources must already be connected through the Jules web
+  application. The result contains bounded source IDs and GitHub repository
+  identity only.
+- `jules.session.create`: required `prompt`; optional `title`, paired `source`
+  and `startingBranch`, and `autoCreatePr`. The provider always sends
+  `requirePlanApproval: true` and rejects an explicit false value. Omitting the
+  source pair creates the repoless session supported by the official API.
+- `jules.session.get`: required `sessionId`, accepting either the ID or
+  `sessions/<id>`. The result contains the session ID, documented state, safe
+  Jules URL, timestamps, and validated GitHub pull request identities. Prompt,
+  title, source context, PR text and unknown upstream fields are omitted.
+- `jules.activities.list`: required `sessionId`, optional `pageSize` (default
+  50, range 1-100), and opaque `pageToken`. Results contain activity ID, type,
+  originator and timestamp. User or agent messages, descriptions, patches,
+  media, shell output and all artifact bodies are omitted.
+- `jules.plan.approve`: required `sessionId`. The registered command opens a
+  modal choice and sends the request only after the human selects `Approve
+  plan`. A detached or noninteractive host fails with `INTERACTION_REQUIRED`.
+
+Requests time out after 30 seconds and responses are capped at 512 KiB before
+JSON parsing. Input and projected output fields have independent byte and item
+limits. Redirects are rejected. The provider makes one upstream request and
+does not retry automatically. In particular, Jules documents no create-session
+idempotency key: a lost response is ambiguous, and retrying creation can create
+a second Jules session. Runtime `correlation_id` prevents concurrent workers
+and ordinary duplicate dispatch for one detached runtime run. A worker crash
+after Jules accepts creation but before the runtime persists completion remains
+ambiguous; recovery may invoke creation again. The provider therefore makes no
+exact-once claim for the external Jules effect.
+
+Successful create/get operations journal `jules.session_created` or
+`jules.session_observed` with only `sessionId`, documented `state`, and an
+optional canonical Jules URL. Each validated PR produces
+`jules.pull_request_observed` with its canonical GitHub URL, owner, repository
+and number. Approval produces `jules.plan_approved`. Stable provider failures
+produce `jules.request_failed` with the operation and error code, plus the
+optional `sessionId` only when it was already validated. Normal run, intent and
+step identifiers may also be present. These closed per-event projections pass
+through `run_logs`; their event IDs and cursors inherit the normal stable
+run-log contract.
+
+Provider errors expose only stable codes and fixed messages:
+`JULES_NOT_CONFIGURED`, `JULES_REQUEST_INVALID`,
+`JULES_PLAN_APPROVAL_REQUIRED`, `JULES_AUTH_FAILED`, `JULES_NOT_FOUND`,
+`JULES_RATE_LIMITED`, `JULES_INVALID_STATE`, `JULES_UNAVAILABLE`,
+`JULES_UPSTREAM_ERROR`, `JULES_RESPONSE_INVALID`,
+`JULES_RESPONSE_TOO_LARGE`, and `JULES_TIMEOUT`. Upstream response bodies are
+never copied into errors. The official API documents session deletion but no
+cancel operation, so this provider does not expose deletion as cancellation.
+
+Official contract references: [quickstart](https://jules.google/docs/api/reference/),
+[authentication](https://jules.google/docs/api/reference/authentication/),
+[sessions](https://jules.google/docs/api/reference/sessions),
+[activities](https://jules.google/docs/api/reference/activities), and
+[sources](https://jules.google/docs/api/reference/sources).
 
 ## Static pipeline validation
 

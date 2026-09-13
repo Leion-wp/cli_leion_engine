@@ -140,6 +140,7 @@ export class CoreRuntime {
         const githubAdapter = require('./providers/githubAdapter');
         const gitAdapter = require('./providers/gitAdapter');
         const dockerAdapter = require('./providers/dockerAdapter');
+        const julesAdapter = require('./providers/julesAdapter');
 
         gitAdapter.registerGitProvider(context);
         dockerAdapter.registerDockerProvider(context);
@@ -149,6 +150,7 @@ export class CoreRuntime {
         aiAdapter.registerAiProvider(context);
         httpAdapter.registerHttpProvider(context);
         githubAdapter.registerGitHubProvider(context);
+        julesAdapter.registerJulesProvider(context);
 
         commands.registerCommand('intentRouter.internal.terminalRun', async (args: any) => {
             return await terminalAdapter.executeTerminalCommand(args);

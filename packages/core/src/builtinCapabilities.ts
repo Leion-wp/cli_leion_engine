@@ -416,6 +416,72 @@ export const githubCapabilities: RegisterCapabilitiesArgs = {
         ]
     };
 
+// Jules is registered only when JULES_API_KEY is present and valid. Keeping the
+// declaration here lets the runtime catalog and provider share one contract
+// without making an unconfigured remote provider appear executable.
+export const julesCapabilities: RegisterCapabilitiesArgs = {
+        provider: 'jules',
+        // The registry's "vscode" transport is its in-process command-handler
+        // path on both VS Code and CLI hosts. "external" is still a hard-fail
+        // placeholder in the router and cannot execute this adapter.
+        type: 'vscode',
+        capabilities: [
+            {
+                capability: 'jules.sources.list',
+                command: 'intentRouter.internal.julesSourcesList',
+                description: 'List GitHub sources already connected to Jules',
+                determinism: 'deterministic',
+                args: [
+                    { name: 'pageSize', type: 'string', description: 'Page size from 1 to 100', default: '30' },
+                    { name: 'pageToken', type: 'string', description: 'Opaque Jules page token' }
+                ]
+            },
+            {
+                capability: 'jules.session.create',
+                command: 'intentRouter.internal.julesSessionCreate',
+                description: 'Create a Jules session with mandatory plan approval',
+                determinism: 'interactive',
+                args: [
+                    { name: 'prompt', type: 'string', description: 'Task for Jules', required: true },
+                    { name: 'title', type: 'string', description: 'Optional session title' },
+                    { name: 'source', type: 'string', description: 'Connected Jules source name (sources/...)' },
+                    { name: 'startingBranch', type: 'string', description: 'Starting branch for the connected GitHub source' },
+                    { name: 'requirePlanApproval', type: 'boolean', description: 'Must remain true', default: true },
+                    { name: 'autoCreatePr', type: 'boolean', description: 'Ask Jules to create a pull request after the approved plan', default: false }
+                ]
+            },
+            {
+                capability: 'jules.session.get',
+                command: 'intentRouter.internal.julesSessionGet',
+                description: 'Get the bounded public state and pull request output of a Jules session',
+                determinism: 'deterministic',
+                args: [
+                    { name: 'sessionId', type: 'string', description: 'Jules session ID or sessions/... name', required: true }
+                ]
+            },
+            {
+                capability: 'jules.plan.approve',
+                command: 'intentRouter.internal.julesPlanApprove',
+                description: 'Approve the plan for a Jules session',
+                determinism: 'interactive',
+                args: [
+                    { name: 'sessionId', type: 'string', description: 'Jules session ID or sessions/... name', required: true }
+                ]
+            },
+            {
+                capability: 'jules.activities.list',
+                command: 'intentRouter.internal.julesActivitiesList',
+                description: 'List bounded Jules activity metadata without messages, patches, media, or shell output',
+                determinism: 'deterministic',
+                args: [
+                    { name: 'sessionId', type: 'string', description: 'Jules session ID or sessions/... name', required: true },
+                    { name: 'pageSize', type: 'string', description: 'Page size from 1 to 100', default: '50' },
+                    { name: 'pageToken', type: 'string', description: 'Opaque Jules page token' }
+                ]
+            }
+        ]
+};
+
 export const builtinCapabilityRegistrations: RegisterCapabilitiesArgs[] = [
     gitCapabilities, dockerCapabilities, terminalCapabilities, systemCapabilities, aiCapabilities, httpCapabilities, githubCapabilities
 ];
