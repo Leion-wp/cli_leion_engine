@@ -215,7 +215,7 @@ function normalizeSessionId(value: unknown): string {
 
 function normalizeSource(value: unknown): string {
     const source = requiredSingleLineString(value, 1024);
-    if (!/^sources\/[A-Za-z0-9._~/-]+$/.test(source) || source.includes('..') || source.includes('//')) {
+    if (!/^sources\/[A-Za-z0-9._~/-]+$/.test(source) || source.endsWith('/') || source.includes('..') || source.includes('//')) {
         throw staticError('JULES_REQUEST_INVALID');
     }
     return source;
@@ -223,8 +223,10 @@ function normalizeSource(value: unknown): string {
 
 function normalizeGitBranch(value: unknown): string {
     const branch = requiredSingleLineString(value, 512);
+    const components = branch.split('/');
     if (
         /\s/.test(branch) ||
+        branch === '@' ||
         branch.startsWith('-') ||
         branch.startsWith('/') ||
         branch.endsWith('/') ||
@@ -234,7 +236,7 @@ function normalizeGitBranch(value: unknown): string {
         branch.includes('//') ||
         branch.includes('@{') ||
         /[~^:?*[\]\\]/.test(branch) ||
-        branch.endsWith('.lock')
+        components.some((component) => component.startsWith('.') || component.endsWith('.') || component.toLowerCase().endsWith('.lock'))
     ) {
         throw staticError('JULES_REQUEST_INVALID');
     }
@@ -261,6 +263,7 @@ function safeTimestamp(value: unknown): string | undefined {
     }
     const date = new Date(text);
     if (
+        Number(match[1]) === 0 ||
         !Number.isFinite(date.getTime()) ||
         date.getUTCFullYear() !== Number(match[1]) ||
         date.getUTCMonth() + 1 !== Number(match[2]) ||
@@ -357,7 +360,9 @@ function projectSource(value: unknown): any {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw staticError('JULES_RESPONSE_INVALID');
     const id = boundedResponseString(raw.id, 512);
     const name = boundedResponseString(raw.name, 1024);
-    if (name !== `sources/${id}`) throw staticError('JULES_RESPONSE_INVALID');
+    if (!/^[A-Za-z0-9._~/-]{1,512}$/.test(id) || id.startsWith('/') || id.endsWith('/') || id.includes('..') || id.includes('//') || name !== `sources/${id}`) {
+        throw staticError('JULES_RESPONSE_INVALID');
+    }
     const repo = raw.githubRepo;
     if (!repo || typeof repo !== 'object' || Array.isArray(repo)) throw staticError('JULES_RESPONSE_INVALID');
     const owner = boundedResponseString(repo.owner, 256);
@@ -373,7 +378,9 @@ function projectActivity(value: unknown, sessionId: string): any {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw staticError('JULES_RESPONSE_INVALID');
     const id = boundedResponseString(raw.id, 512);
     const name = boundedResponseString(raw.name, 1024);
-    if (name !== `sessions/${sessionId}/activities/${id}`) throw staticError('JULES_RESPONSE_INVALID');
+    if (!/^[A-Za-z0-9._~-]{1,512}$/.test(id) || name !== `sessions/${sessionId}/activities/${id}`) {
+        throw staticError('JULES_RESPONSE_INVALID');
+    }
     const originator = optionalResponseString(raw.originator, 64);
     if (originator !== undefined && !['user', 'agent', 'system'].includes(originator)) {
         throw staticError('JULES_RESPONSE_INVALID');

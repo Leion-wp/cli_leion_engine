@@ -191,8 +191,13 @@ test('arguments are own-data allowlists with multiline prompt and single-line id
   for (const args of [
     { prompt: 'task', title: 'bad\ntitle' },
     { prompt: 'task', source: 'sources/github/repo\n', startingBranch: 'main' },
+    { prompt: 'task', source: 'sources/github/repo/', startingBranch: 'main' },
     { prompt: 'task', source: 'sources/github/repo', startingBranch: '../main' },
-    { prompt: 'task', source: 'sources/github/repo', startingBranch: 'main lock.lock' }
+    { prompt: 'task', source: 'sources/github/repo', startingBranch: 'main lock.lock' },
+    { prompt: 'task', source: 'sources/github/repo', startingBranch: '@' },
+    { prompt: 'task', source: 'sources/github/repo', startingBranch: 'main/.hidden' },
+    { prompt: 'task', source: 'sources/github/repo', startingBranch: 'main/topic.' },
+    { prompt: 'task', source: 'sources/github/repo', startingBranch: 'main/topic.LOCK' }
   ]) await assert.rejects(client.createSession(args), expectCode('JULES_REQUEST_INVALID'));
   await assert.rejects(client.listSources({ pageToken: 'bad\ntoken' }), expectCode('JULES_REQUEST_INVALID'));
   await assert.rejects(client.getSession({ sessionId: 'bad\nid' }), expectCode('JULES_REQUEST_INVALID'));
@@ -252,10 +257,18 @@ test('source and activity pagination is bounded and strips messages, patches, sh
   await assert.rejects(client.listActivities({ sessionId: 'session-123', pageSize: 0 }), expectCode('JULES_REQUEST_INVALID'));
   for (const activity of [
     { name: 'sessions/session-123/activities/a', id: 'a', originator: 'attacker', agentMessaged: {} },
-    { name: 'sessions/session-123/activities/a', id: 'a', originator: 'agent', agentMessaged: 'raw-message' }
+    { name: 'sessions/session-123/activities/a', id: 'a', originator: 'agent', agentMessaged: 'raw-message' },
+    { name: 'sessions/session-123/activities/nested/a', id: 'nested/a', originator: 'agent', agentMessaged: {} }
   ]) {
     const invalid = adapter.createJulesClient({ apiKey: 'test-key', fetchImpl: async () => jsonResponse({ activities: [activity] }) });
     await assert.rejects(invalid.listActivities({ sessionId: 'session-123' }), expectCode('JULES_RESPONSE_INVALID'));
+  }
+  for (const id of ['/github/repo', 'github/repo/', 'github//repo', 'github/../repo']) {
+    const invalid = adapter.createJulesClient({
+      apiKey: 'test-key',
+      fetchImpl: async () => jsonResponse({ sources: [{ name: `sources/${id}`, id, githubRepo: { owner: 'leion', repo: 'repo' } }] })
+    });
+    await assert.rejects(invalid.listSources(), expectCode('JULES_RESPONSE_INVALID'));
   }
 });
 
@@ -340,7 +353,7 @@ test('all documented states and Google UTC timestamp precisions are projected ca
     const client = adapter.createJulesClient({ apiKey: 'test-key', fetchImpl: async () => jsonResponse(session({ createTime: input })) });
     assert.equal((await client.getSession({ sessionId: 'session-123' })).createTime, expected);
   }
-  for (const timestamp of ['2026-09-13T12:00:00+02:00', '2026-02-30T10:00:00Z', 'September 13, 2026']) {
+  for (const timestamp of ['0000-09-13T10:00:00Z', '2026-09-13T12:00:00+02:00', '2026-02-30T10:00:00Z', 'September 13, 2026']) {
     const invalid = adapter.createJulesClient({ apiKey: 'test-key', fetchImpl: async () => jsonResponse(session({ updateTime: timestamp })) });
     await assert.rejects(invalid.getSession({ sessionId: 'session-123' }), expectCode('JULES_RESPONSE_INVALID'));
   }
