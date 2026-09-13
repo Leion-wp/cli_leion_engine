@@ -134,6 +134,7 @@ export class CoreRuntime {
         const context = { subscriptions: [] as any[] };
         const terminalAdapter = require('./providers/terminalAdapter');
         const systemAdapter = require('./providers/systemAdapter');
+        const policyAdapter = require('./providers/policyAdapter');
         const aiAdapter = require('./providers/aiAdapter');
         const httpAdapter = require('./providers/httpAdapter');
         const githubAdapter = require('./providers/githubAdapter');
@@ -144,6 +145,7 @@ export class CoreRuntime {
         dockerAdapter.registerDockerProvider(context);
         terminalAdapter.registerTerminalProvider(context);
         systemAdapter.registerSystemProvider(context);
+        policyAdapter.registerPolicyProvider(context);
         aiAdapter.registerAiProvider(context);
         httpAdapter.registerHttpProvider(context);
         githubAdapter.registerGitHubProvider(context);
