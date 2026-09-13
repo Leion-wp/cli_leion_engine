@@ -1,6 +1,7 @@
 import { builtinCapabilityRegistrations } from './builtinCapabilities';
 import { policyCapabilities } from './policyCapability';
 import { CapabilityArgument } from './types';
+import { RUN_LOG_CONTRACT } from './runLogContract';
 
 export const PROTOCOL_VERSION = '1';
 export const PROTOCOL_COMMANDS = [
@@ -125,7 +126,12 @@ export function describeRuntime(version: string) {
     return {
         ok: true,
         protocolVersion: PROTOCOL_VERSION,
-        runtime: { name: 'leion-roots', version, capabilities: [...PROTOCOL_COMMANDS] },
+        runtime: {
+            name: 'leion-roots',
+            version,
+            capabilities: [...PROTOCOL_COMMANDS],
+            contracts: { run_logs: RUN_LOG_CONTRACT }
+        },
         capabilities: getRuntimeCapabilities()
     };
 }

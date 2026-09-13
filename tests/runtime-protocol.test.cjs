@@ -78,6 +78,15 @@ test('catalog preserves shared registration descriptors and exposes conservative
   const envelope = describeRuntime('fixture-version');
   assert.equal(envelope.runtime.version, 'fixture-version');
   assert.deepEqual(envelope.runtime.capabilities, PROTOCOL_COMMANDS);
+  assert.equal(envelope.runtime.contracts.run_logs.cursorFormat, 'lr1');
+  assert.equal(envelope.runtime.contracts.run_logs.eventVersion, 1);
+  assert.deepEqual(envelope.runtime.contracts.run_logs.limits, {
+    default: 100,
+    max: 200,
+    maxRecordBytes: 16384,
+    maxResponseBytes: 524288,
+    maxScanBytes: 8388608
+  });
 });
 
 test('describe and catalog return directly parsable protocol JSON without runtime construction or writes', (t) => {
