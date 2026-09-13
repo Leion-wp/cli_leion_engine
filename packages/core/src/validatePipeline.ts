@@ -1,6 +1,6 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { CapabilityDescriptor, getRuntimeCapabilities, PROTOCOL_VERSION } from './runtimeCatalog';
+import { PipelineSourcePathError, readPipelineSource, resolvePipelineSourcePath } from './pipelineSource';
 
 export type ValidationDiagnostic = {
     code: string;
@@ -26,36 +26,8 @@ const pointerKey = (value: string) => value.replace(/~/g, '~0').replace(/\//g, '
 const valueType = (value: unknown) => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
 const dynamic = (value: unknown) => typeof value === 'string' && /\$\{[^}]+\}/.test(value);
 
-function inside(root: string, candidate: string): boolean {
-    const relative = path.relative(root, candidate);
-    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-}
-
-class ValidationPathError extends Error {
-    constructor(readonly code: string, message: string) { super(message); }
-}
-
 export function resolveValidationPath(workspace: string, reference: string): string {
-    const root = path.resolve(workspace);
-    if (!reference || !reference.trim()) throw new ValidationPathError('PIPELINE_REQUIRED', 'A pipeline name or path is required.');
-    if (reference.includes('\0')) throw new ValidationPathError('INVALID_PATH', 'Pipeline paths cannot contain NUL.');
-    if (process.platform !== 'win32' && path.win32.isAbsolute(reference) && !path.isAbsolute(reference)) {
-        throw new ValidationPathError('PATH_OUTSIDE_PIPELINE', 'A foreign absolute path is outside the workspace pipeline directory.');
-    }
-    const ref = reference.replace(/[\\/]/g, path.sep);
-    const withExtension = ref.endsWith('.intent.json') ? ref : `${ref}.intent.json`;
-    const pipelineRoot = path.join(root, 'pipeline');
-    const candidate = path.isAbsolute(withExtension)
-        ? path.resolve(withExtension)
-        : path.resolve(withExtension.includes(path.sep) ? root : pipelineRoot, withExtension);
-    if (!inside(pipelineRoot, candidate)) throw new ValidationPathError('PATH_OUTSIDE_PIPELINE', 'Pipeline files must stay under <workspace>/pipeline.');
-    const realRoot = fs.realpathSync(root);
-    const realPipelineRoot = fs.realpathSync(pipelineRoot);
-    if (!inside(realRoot, realPipelineRoot)) throw new ValidationPathError('PATH_OUTSIDE_WORKSPACE', 'The pipeline directory resolves outside the workspace.');
-    const realCandidate = fs.realpathSync(candidate);
-    if (!inside(realPipelineRoot, realCandidate)) throw new ValidationPathError('PATH_OUTSIDE_PIPELINE', 'The pipeline file resolves outside the pipeline directory.');
-    if (!fs.statSync(realCandidate).isFile()) throw new ValidationPathError('NOT_A_FILE', 'The pipeline path must identify a regular file.');
-    return realCandidate;
+    return resolvePipelineSourcePath(workspace, reference);
 }
 
 export function validatePipelineData(input: unknown, catalog: CapabilityDescriptor[] = getRuntimeCapabilities()): PipelineValidation {
@@ -165,9 +137,10 @@ export function validatePipelineData(input: unknown, catalog: CapabilityDescript
 export function validatePipelineFile(workspace: string, reference: string): PipelineValidation {
     let file: string | undefined;
     try {
-        file = resolveValidationPath(workspace, reference);
+        const source = readPipelineSource(workspace, reference);
+        file = source.path;
         let input: unknown;
-        try { input = JSON.parse(fs.readFileSync(file, 'utf8')); }
+        try { input = JSON.parse(source.bytes.toString('utf8')); }
         catch (error) {
             return { ok: false, protocolVersion: PROTOCOL_VERSION, valid: false, path: file, diagnostics: [{
                 code: error instanceof SyntaxError ? 'INVALID_JSON' : 'READ_FAILED', severity: 'error', path: '', file,
@@ -178,8 +151,8 @@ export function validatePipelineFile(workspace: string, reference: string): Pipe
         return { ...result, path: file, diagnostics: result.diagnostics.map((entry) => ({ ...entry, file })) };
     } catch (error: any) {
         return { ok: false, protocolVersion: PROTOCOL_VERSION, valid: false, diagnostics: [{
-            code: error instanceof ValidationPathError ? error.code : 'PATH_UNAVAILABLE', severity: 'error', path: '',
-            message: error instanceof ValidationPathError ? error.message : 'The workspace, pipeline directory, or file is unavailable.'
+            code: error instanceof PipelineSourcePathError ? error.code : 'PATH_UNAVAILABLE', severity: 'error', path: '',
+            message: error instanceof PipelineSourcePathError ? error.message : 'The workspace, pipeline source root, or file is unavailable.'
         }] };
     }
 }

@@ -89,6 +89,16 @@ Describe and catalog return the same versioned envelope:
     "version": "0.1.0",
     "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "run_status", "run_list", "run_logs", "history_list", "history_show", "stop_pipeline", "resume_pipeline", "cancel_pipeline"],
     "contracts": {
+      "pipeline_inputs": {
+        "version": "1",
+        "authorRoot": "pipeline",
+        "approvedBundleRoot": ".leiok/execution-bundles",
+        "absolutePathPolicy": "allowed_roots_only",
+        "regularFileRequired": true,
+        "redirectedAncestors": "confined_to_workspace",
+        "validationExecutionParity": true,
+        "approvedBundleFilenameSha256": true
+      },
       "run_controls": {
         "version": "1",
         "idempotent": true,
@@ -132,6 +142,13 @@ provider declarations, plus the runner/router-owned `pipeline.run` container.
 cancellation contract consumed by control planes; command names alone do not
 prove those semantics. `runtime.contracts.run_logs` describes the durable event
 page that can be ingested without legacy log fallbacks.
+`runtime.contracts.pipeline_inputs` identifies the two confined roots accepted
+by validation and execution. Author-managed pipelines live under `pipeline/`;
+immutable control-plane bundles must use the exact
+`.leiok/execution-bundles/<plan_id>/<sha256>.intent.json` layout. Absolute paths
+are accepted only when they resolve to one of those forms, and symlink or
+junction redirections cannot escape the real workspace. The bundle filename
+must equal the SHA-256 of the exact bytes that validation or execution parses.
 It neither constructs a runtime nor loads workspace configuration, custom
 nodes, credential material, history, or mutable provider registrations. It
 checks only whether `JULES_API_KEY` is present and structurally valid so the

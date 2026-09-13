@@ -3,6 +3,7 @@ import { policyCapabilities } from './policyCapability';
 import { CapabilityArgument } from './types';
 import { RUN_LOG_CONTRACT } from './runLogContract';
 import { RUN_CONTROL_CONTRACT } from './runControlContract';
+import { PIPELINE_INPUT_CONTRACT } from './pipelineSource';
 import { isJulesConfigured } from './providers/julesAdapter';
 
 export const PROTOCOL_VERSION = '1';
@@ -148,6 +149,7 @@ export function describeRuntime(version: string) {
             version,
             capabilities: [...PROTOCOL_COMMANDS],
             contracts: {
+                pipeline_inputs: PIPELINE_INPUT_CONTRACT,
                 run_controls: RUN_CONTROL_CONTRACT,
                 run_logs: RUN_LOG_CONTRACT
             }

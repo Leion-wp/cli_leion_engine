@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
 import { createHash, randomBytes } from 'crypto';
+import { PipelineSourcePathError, readPipelineSource } from '../pipelineSource';
 import {
     RUN_LOG_CURSOR_FORMAT,
     RUN_LOG_DEFAULT_LIMIT,
@@ -717,17 +718,6 @@ function requestFingerprint(input: {
     return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
 
-function resolvePipelinePath(workspaceRoot: string, pipelineRef: string): string {
-    const raw = String(pipelineRef || '').trim();
-    if (!raw) throw new RunSupervisorError('PIPELINE_REQUIRED', 'Pipeline reference is required.');
-    const withExtension = raw.endsWith('.intent.json') ? raw : `${raw}.intent.json`;
-    if (path.isAbsolute(withExtension)) return path.resolve(withExtension);
-    if (withExtension.includes('/') || withExtension.includes('\\')) {
-        return path.resolve(workspaceRoot, withExtension);
-    }
-    return path.resolve(workspaceRoot, 'pipeline', withExtension);
-}
-
 export function tryAcquireExecutionClaim(workspaceRoot: string, detachedRunId: string): boolean {
     const claimPath = executionClaimFilePath(workspaceRoot, detachedRunId);
     const statePath = stateFilePath(workspaceRoot, detachedRunId);
@@ -1050,12 +1040,17 @@ export class RunSupervisorService {
     start_detached(options: StartDetachedOptions): StartDetachedResult {
         const pipeline = String(options.pipeline || '').trim();
         if (!pipeline) throw new RunSupervisorError('PIPELINE_REQUIRED', 'start_detached requires pipeline.');
-        const pipelinePath = canonicalExistingPath(
-            resolvePipelinePath(this.workspaceRoot, pipeline),
-            'PIPELINE_NOT_FOUND',
-            'Pipeline'
-        );
-        const pipelineHash = createHash('sha256').update(fs.readFileSync(pipelinePath)).digest('hex');
+        let source;
+        try {
+            source = readPipelineSource(this.workspaceRoot, pipeline);
+        } catch (error) {
+            if (error instanceof PipelineSourcePathError) {
+                throw new RunSupervisorError(error.code, error.message);
+            }
+            throw error;
+        }
+        const pipelinePath = source.path;
+        const pipelineHash = source.contentHash;
         const from = String(options.from || '').trim() || undefined;
         const dryRun = options.dryRun === true;
         const fingerprint = requestFingerprint({

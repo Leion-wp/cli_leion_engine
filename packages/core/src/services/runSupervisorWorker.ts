@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
 import { CoreRuntime } from '../coreRuntime';
 import { pipelineEventBus } from '../eventBus';
+import { readPipelineSource } from '../pipelineSource';
 import {
     appendEventRecord,
     cancelFilePath,
@@ -158,13 +158,25 @@ async function main(): Promise<void> {
     };
     writeJsonFile(statePath, state);
 
-    let pipelineBytes: Buffer;
+    let pipelineSource;
     try {
-        pipelineBytes = fs.readFileSync(args.pipelinePath);
+        pipelineSource = readPipelineSource(args.workspaceRoot, args.pipelinePath);
     } catch {
-        failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Pipeline content changed before execution.');
+        failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Pipeline path or content changed before execution.');
     }
-    const actualHash = createHash('sha256').update(pipelineBytes).digest('hex');
+    const pipelinePath = pipelineSource.path;
+    let persistedPipelinePath: string;
+    try {
+        persistedPipelinePath = fs.realpathSync.native(String(state.pipelinePath || ''));
+    } catch {
+        failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Pipeline path changed before execution.');
+    }
+    if (pipelinePath !== persistedPipelinePath) {
+        failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Pipeline path changed before execution.');
+    }
+
+    const pipelineBytes = pipelineSource.bytes;
+    const actualHash = pipelineSource.contentHash;
     if (actualHash !== args.pipelineHash) {
         failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Pipeline content changed before execution.');
     }
@@ -216,7 +228,7 @@ async function main(): Promise<void> {
     appendEvent('run.worker_started', {
         detachedRunId: args.runId,
         pipeline: args.pipeline,
-        pipelinePath: args.pipelinePath,
+        pipelinePath,
         from: args.from,
         dryRun: args.dryRun
     }, args.runId);
