@@ -340,16 +340,20 @@ async function runWorker(flags: Record<string, string | boolean>): Promise<void>
             from
         });
         const state = fs.existsSync(statePath) ? readJson(statePath) : {};
-        state.status = result?.status || (result?.success ? 'success' : 'failure');
-        state.result = result;
+        const projectedResult = core.projectRunResult(result);
+        state.status = projectedResult.status;
+        state.result = projectedResult;
         state.updatedAt = Date.now();
         state.endedAt = Date.now();
         writeJson(statePath, state);
         process.exit(result?.success ? 0 : 1);
     } catch (error: any) {
         const state = fs.existsSync(statePath) ? readJson(statePath) : {};
+        const sanitizedError = core.sanitizeWorkerError(error);
         state.status = 'failure';
-        state.error = String(error?.message || error || 'Unknown worker failure');
+        state.errorCode = sanitizedError.code;
+        state.error = sanitizedError.message;
+        state.result = undefined;
         state.updatedAt = Date.now();
         state.endedAt = Date.now();
         writeJson(statePath, state);
@@ -366,17 +370,26 @@ async function runWorker(flags: Record<string, string | boolean>): Promise<void>
 
 async function handleRunPipeline(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
     const pipeline = String(flags.pipeline || '').trim();
-    const pipelinePath = resolvePipelineRuntimePath(workspaceRoot, pipeline);
     const from = String(flags.from || '').trim() || undefined;
     const dryRun = asBool(flags.dry_run);
     const detached = asBool(flags.detached);
     const verbose = asBool(flags.verbose);
+    if (flags.correlation_id === true) {
+        throw Object.assign(new Error('--correlation_id requires a value.'), { code: 'RUN_CORRELATION_INVALID' });
+    }
+    const correlationId = String(flags.correlation_id || '').trim() || undefined;
 
     if (!pipeline) {
-        throw new Error('run_pipeline requires --pipeline');
+        throw Object.assign(new Error('run_pipeline requires --pipeline'), { code: 'PIPELINE_REQUIRED' });
     }
+    const pipelinePath = resolvePipelineRuntimePath(workspaceRoot, pipeline);
 
     if (!detached) {
+        if (correlationId) {
+            throw Object.assign(new Error('--correlation_id requires --detached.'), {
+                code: 'RUN_CORRELATION_REQUIRES_DETACHED'
+            });
+        }
         const runtime = createRuntime(workspaceRoot, verbose);
         const result = await runtime.run_pipeline_file(pipelinePath, {
             dryRun,
@@ -389,77 +402,65 @@ async function handleRunPipeline(workspaceRoot: string, flags: Record<string, st
         return;
     }
 
-    const detachedRunId = generateDetachedRunId();
-    const state = {
-        detachedRunId,
-        workspaceRoot,
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    const result = supervisor.start_detached({
         pipeline,
         from,
         dryRun,
-        status: 'starting',
-        startedAt: Date.now(),
-        updatedAt: Date.now()
-    };
-    writeJson(stateFilePath(workspaceRoot, detachedRunId), state);
-
-    const cliEntry = path.resolve(__dirname, 'index.js');
-    const args = [cliEntry, '__worker_run', '--run_id', detachedRunId, '--pipeline', pipeline, '--workspace', workspaceRoot];
-    if (from) args.push('--from', from);
-    if (dryRun) args.push('--dry_run');
-    if (verbose) args.push('--verbose');
-
-    const child = cp.spawn(process.execPath, args, {
-        cwd: workspaceRoot,
-        detached: true,
-        stdio: 'ignore'
+        verbose,
+        correlationId
     });
-    child.unref();
-
-    const nextState = readJson(stateFilePath(workspaceRoot, detachedRunId));
-    nextState.pid = child.pid;
-    nextState.updatedAt = Date.now();
-    writeJson(stateFilePath(workspaceRoot, detachedRunId), nextState);
-
-    process.stdout.write(`${JSON.stringify({ run_id: detachedRunId, pid: child.pid, status: 'detached' }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-async function writeControlCommand(workspaceRoot: string, flags: Record<string, string | boolean>, action: 'pause' | 'resume'): Promise<void> {
+async function handleRunStatus(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
     const requestedRunId = String(flags.run_id || '').trim();
-    if (!requestedRunId) {
-        throw new Error(`${action === 'pause' ? 'stop_pipeline' : 'resume_pipeline'} requires --run_id`);
-    }
-    const located = findRunState(workspaceRoot, requestedRunId);
-    if (!located) {
-        throw new Error(`Run not found for id: ${requestedRunId}`);
-    }
-    const detachedRunId = String(located.state?.detachedRunId || '').trim();
-    if (!detachedRunId) {
-        throw new Error(`Detached run id is missing in state file for ${requestedRunId}`);
-    }
+    if (!requestedRunId) throw Object.assign(new Error('run_status requires --run_id'), { code: 'RUN_ID_REQUIRED' });
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    const state = supervisor.getRunStatus(requestedRunId);
+    if (!state) throw Object.assign(new Error(`Run not found for id: ${requestedRunId}`), { code: 'RUN_NOT_FOUND' });
+    process.stdout.write(`${JSON.stringify({
+        ...state,
+        ...(state.correlationId ? { correlation_id: state.correlationId } : {})
+    }, null, 2)}\n`);
+}
 
-    writeJson(ctrlFilePath(workspaceRoot, detachedRunId), {
-        action,
-        requestedRunId,
-        updatedAt: Date.now()
-    });
+async function handleRunList(workspaceRoot: string): Promise<void> {
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    const runs = supervisor.list_run_statuses().map((state: any) => ({
+        ...state,
+        ...(state.correlationId ? { correlation_id: state.correlationId } : {})
+    }));
+    process.stdout.write(`${JSON.stringify({ runs }, null, 2)}\n`);
+}
 
-    const pid = Number(located.state?.pid || 0);
-    if (Number.isFinite(pid) && pid > 0) {
-        try {
-            if (process.platform !== 'win32') {
-                process.kill(pid, action === 'pause' ? 'SIGSTOP' : 'SIGCONT');
-            }
-        } catch {
-            // Best effort signal fallback.
-        }
+async function handleRunLogs(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
+    const requestedRunId = String(flags.run_id || '').trim();
+    if (!requestedRunId) throw Object.assign(new Error('run_logs requires --run_id'), { code: 'RUN_ID_REQUIRED' });
+    const cursorRaw = String(flags.cursor || '').trim();
+    const cursor = cursorRaw ? Number(cursorRaw) : undefined;
+    if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
+        throw Object.assign(new Error('run_logs --cursor must be a non-negative integer.'), { code: 'RUN_CURSOR_INVALID' });
     }
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    process.stdout.write(`${JSON.stringify(supervisor.tail_events(requestedRunId, cursor), null, 2)}\n`);
+}
 
-    located.state.updatedAt = Date.now();
-    located.state.lastControl = action;
-    located.state.status = action === 'pause' ? 'paused' : 'running';
-    writeJson(located.filePath, located.state);
+async function writeControlCommand(
+    workspaceRoot: string,
+    flags: Record<string, string | boolean>,
+    action: 'pause' | 'resume' | 'cancel'
+): Promise<void> {
+    const requestedRunId = String(flags.run_id || '').trim();
+    if (!requestedRunId) throw Object.assign(new Error(`${action}_pipeline requires --run_id`), { code: 'RUN_ID_REQUIRED' });
+    const supervisor = new core.RunSupervisorService(workspaceRoot);
+    const result = action === 'pause'
+        ? supervisor.pause_run(requestedRunId)
+        : action === 'resume'
+            ? supervisor.resume_run(requestedRunId)
+            : supervisor.cancel_run(requestedRunId);
 
-    process.stdout.write(`${JSON.stringify({ run_id: requestedRunId, detached_run_id: detachedRunId, action }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function handleRouteIntent(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -537,9 +538,13 @@ function printHelp(): void {
         '  add_node --pipeline <path|name> --yaml <payload|-> [--verbose]',
         '  delete_node --pipeline <path|name> --node_position <id> [--verbose]',
         '  replace_node --pipeline <path|name> --yaml <payload|-> [--verbose]',
-        '  run_pipeline --pipeline <path|name> [--from <node_position>] [--dry_run] [--detached] [--verbose]',
-        '  stop_pipeline --run_id <id> [--verbose]',
-        '  resume_pipeline --run_id <id> [--verbose]',
+        '  run_pipeline --pipeline <path|name> [--from <node_position>] [--dry_run] [--detached] [--correlation_id <id>] [--verbose]',
+        '  run_status --run_id <detached|runtime|correlation> [--json]',
+        '  run_list [--json]',
+        '  run_logs --run_id <detached|runtime|correlation> [--cursor <offset>] [--json]',
+        '  stop_pipeline --run_id <detached|runtime|correlation> [--verbose]',
+        '  resume_pipeline --run_id <detached|runtime|correlation> [--verbose]',
+        '  cancel_pipeline --run_id <detached|runtime|correlation> [--verbose]',
         '  route_intent --intent_json <json|@file> [--verbose]',
         '  history_list [--verbose]',
         '  history_show --run_id <id> [--verbose]',
@@ -603,11 +608,23 @@ async function main(): Promise<void> {
         case 'run_pipeline':
             await handleRunPipeline(workspaceRoot, parsed.flags);
             return;
+        case 'run_status':
+            await handleRunStatus(workspaceRoot, parsed.flags);
+            return;
+        case 'run_list':
+            await handleRunList(workspaceRoot);
+            return;
+        case 'run_logs':
+            await handleRunLogs(workspaceRoot, parsed.flags);
+            return;
         case 'stop_pipeline':
             await writeControlCommand(workspaceRoot, parsed.flags, 'pause');
             return;
         case 'resume_pipeline':
             await writeControlCommand(workspaceRoot, parsed.flags, 'resume');
+            return;
+        case 'cancel_pipeline':
+            await writeControlCommand(workspaceRoot, parsed.flags, 'cancel');
             return;
         case 'route_intent':
             await handleRouteIntent(workspaceRoot, parsed.flags);

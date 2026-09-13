@@ -5,7 +5,8 @@ import { CapabilityArgument } from './types';
 export const PROTOCOL_VERSION = '1';
 export const PROTOCOL_COMMANDS = [
     'catalog', 'validate_pipeline', 'run_pipeline', 'route_intent',
-    'history_list', 'history_show', 'stop_pipeline', 'resume_pipeline'
+    'run_status', 'run_list', 'run_logs',
+    'history_list', 'history_show', 'stop_pipeline', 'resume_pipeline', 'cancel_pipeline'
 ];
 
 export type CatalogArgument = CapabilityArgument & { acceptedTypes?: string[] };
@@ -88,7 +89,9 @@ function executionFacts(capability: string): Pick<CapabilityDescriptor, 'host' |
 export function getRuntimeCapabilities(): CapabilityDescriptor[] {
     const descriptors: CapabilityDescriptor[] = [{
         capability: 'pipeline.run', provider: 'runtime', command: 'run_pipeline',
-        type: 'unknown', capabilityType: 'composite', determinism: 'unknown', args: [],
+        type: 'unknown', capabilityType: 'composite', determinism: 'unknown', args: [
+            { name: 'correlation_id', type: 'string', required: false, description: 'Idempotency key for detached execution' }
+        ],
         description: 'Pipeline container and inline composite intent supported by the runner/router',
         host: 'cli', executionMode: 'composite', risk: 'unknown', requirements: [], available: true
     }];

@@ -5,7 +5,8 @@
   "main": "out/index.js",
   "types": "out/index.d.ts",
   "scripts": {
-    "build": "tsc -p ./tsconfig.json"
+    "build": "tsc -p ./tsconfig.json",
+    "test": "npm run build && node --test out/__tests__/runSupervisorService.test.js"
   },
   "dependencies": {
     "glob": "^13.0.0",

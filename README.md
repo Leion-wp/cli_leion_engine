@@ -87,7 +87,7 @@ Describe and catalog return the same versioned envelope:
   "runtime": {
     "name": "leion-roots",
     "version": "0.1.0",
-    "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "history_list", "history_show", "stop_pipeline", "resume_pipeline"]
+    "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "run_status", "run_list", "run_logs", "history_list", "history_show", "stop_pipeline", "resume_pipeline", "cancel_pipeline"]
   },
   "capabilities": []
 }
@@ -123,6 +123,73 @@ rejects `--json`. Unsupported catalogue sections also return a JSON diagnostic
 with a non-zero exit code. The new describe/catalog/validation commands return
 JSON success responses even without `--json`; pass the flag to also guarantee
 JSON responses for command errors.
+
+## Idempotent detached runs
+
+`run_pipeline --detached --correlation_id <id>` binds one caller-provided key
+to the real workspace, resolved pipeline path, SHA-256 of the pipeline bytes,
+`from` value and `dry_run` flag. A retry with the same immutable values returns
+the original detached run without starting another live worker. A different
+value returns the stable `RUN_CORRELATION_CONFLICT` diagnostic. Correlation IDs are limited to 1-128
+ASCII letters, numbers, dots, underscores, colons and hyphens; unsafe input
+returns `RUN_CORRELATION_INVALID`.
+
+Successful creation and retries return:
+
+```json
+{
+  "run_id": "run_example",
+  "detached_run_id": "run_example",
+  "correlation_id": "delivery:42",
+  "pid": 1234,
+  "status": "starting",
+  "reused": false
+}
+```
+
+Without `correlation_id`, each invocation still creates a new run and preserves
+the legacy creation status `"detached"`. `recovered: true` is included when a
+retry resumes a `starting` run abandoned before worker handoff or observes its
+exclusive execution claim after PID-state persistence failed. `run_status`, `run_logs`, `stop_pipeline`,
+`resume_pipeline` and `cancel_pipeline` accept the detached run ID, runtime run
+ID or correlation ID through `--run_id`. `run_list` returns `{ "runs": [] }`.
+Use `--json` for the versioned error envelope. A missing lookup exits 1 and
+returns diagnostic code `RUN_NOT_FOUND`; an invalid log cursor returns
+`RUN_CURSOR_INVALID`. Control of a terminal run returns
+`RUN_CONTROL_INVALID_STATE`. Worker spawn and PID-state persistence failures use
+`RUN_WORKER_SPAWN_FAILED` and `RUN_STATE_PERSIST_FAILED` respectively.
+Fresh `starting` states have a five-second handoff grace. After that grace, a
+nonterminal state with no live worker or claim becomes `failure` with
+`RUN_WORKER_NOT_RUNNING` in the returned projection. Status reads never start a
+worker or rewrite run state.
+Changing the pipeline after it has been claimed makes a retry conflict; if it
+changes between claim and worker startup, the worker exits with
+`RUN_PIPELINE_CHANGED` before constructing `CoreRuntime`.
+
+Control responses contain the requested `run_id`, resolved `detached_run_id`,
+optional `correlation_id`, and `action`. `stop_pipeline` returns action `pause`;
+`resume_pipeline` returns `resume`; `cancel_pipeline` returns `cancel`. Each
+persisted control request has a unique internal request ID, so commands created
+in the same millisecond remain distinct.
+
+Correlation, spawn and execution claims are published atomically under
+`.intent-router/runs`; correlation filenames use SHA-256 rather than caller
+input. State replacement is atomic. The worker holds an exclusive execution
+claim before pipeline verification and entering `CoreRuntime`, so concurrent callers and crash recovery
+cannot invoke two providers for one detached run. Persisted event payloads omit
+all fields outside a small metadata allowlist. Log text is stored only as byte
+length and SHA-256. Worker state stores a result summary and a stable sanitized
+error code/message rather than provider output or exception text.
+
+The public correlation/run contract uses these diagnostic codes:
+`RUN_CORRELATION_REQUIRES_DETACHED`, `RUN_CORRELATION_INVALID`,
+`RUN_CORRELATION_CONFLICT`, `RUN_CORRELATION_CLAIM_INVALID`,
+`RUN_ID_REQUIRED`, `RUN_ID_INVALID`, `RUN_ID_EXHAUSTED`, `RUN_NOT_FOUND`,
+`RUN_CURSOR_INVALID`, `RUN_STATE_INVALID`, `RUN_STATE_PERSIST_FAILED`,
+`RUN_WORKER_SPAWN_FAILED`, `RUN_WORKER_NOT_RUNNING`,
+`RUN_CONTROL_INVALID_STATE`, `RUN_PIPELINE_CHANGED`, `RUN_PIPELINE_INVALID`,
+`RUN_SPAWN_CLAIM_TIMEOUT`, `RUN_STORAGE_UNSAFE`, `PIPELINE_REQUIRED`,
+`PIPELINE_NOT_FOUND`, and `WORKSPACE_NOT_FOUND`.
 
 ## Static pipeline validation
 
