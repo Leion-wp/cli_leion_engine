@@ -343,6 +343,13 @@ const EVENT_PAYLOAD_FIELDS = [
     'dryRun', 'code'
 ] as const;
 
+const JULES_ERROR_CODES = new Set([
+    'JULES_NOT_CONFIGURED', 'JULES_REQUEST_INVALID', 'JULES_PLAN_APPROVAL_REQUIRED',
+    'JULES_AUTH_FAILED', 'JULES_NOT_FOUND', 'JULES_RATE_LIMITED',
+    'JULES_INVALID_STATE', 'JULES_UNAVAILABLE', 'JULES_UPSTREAM_ERROR',
+    'JULES_RESPONSE_INVALID', 'JULES_RESPONSE_TOO_LARGE', 'JULES_TIMEOUT'
+]);
+
 export function projectRunEventPayload(eventType: string, value: any): Record<string, any> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
     const projected: Record<string, any> = {};
@@ -355,6 +362,53 @@ export function projectRunEventPayload(eventType: string, value: any): Record<st
     if (eventType === 'stepLog' && typeof value.text === 'string') {
         projected.textLength = Buffer.byteLength(value.text, 'utf8');
         projected.textSha256 = createHash('sha256').update(value.text, 'utf8').digest('hex');
+    }
+    if (eventType.startsWith('jules.')) {
+        const safe: Record<string, any> = {};
+        for (const key of ['runId', 'intentId', 'stepId'] as const) {
+            if (typeof value[key] === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value[key])) safe[key] = value[key];
+        }
+        const sessionId = typeof value.sessionId === 'string' && /^[A-Za-z0-9._~-]{1,255}$/.test(value.sessionId)
+            ? value.sessionId
+            : undefined;
+        if (sessionId) safe.sessionId = sessionId;
+        if (eventType === 'jules.session_created' || eventType === 'jules.session_observed') {
+            if (typeof value.state === 'string' && [
+                'STATE_UNSPECIFIED', 'QUEUED', 'PLANNING', 'AWAITING_PLAN_APPROVAL',
+                'AWAITING_USER_FEEDBACK', 'IN_PROGRESS', 'PAUSED', 'FAILED', 'COMPLETED'
+            ].includes(value.state)) safe.state = value.state;
+            if (sessionId && typeof value.sessionUrl === 'string' && Buffer.byteLength(value.sessionUrl, 'utf8') <= 2048) {
+                try {
+                    const url = new URL(value.sessionUrl);
+                    if (url.protocol === 'https:' && !url.port && !url.username && !url.password && !url.search && !url.hash && url.hostname.toLowerCase() === 'jules.google.com' && url.pathname === `/session/${sessionId}`) {
+                        safe.sessionUrl = url.toString();
+                    }
+                } catch { /* omit invalid URL */ }
+            }
+        } else if (eventType === 'jules.plan_approved') {
+            if (value.approved === true) safe.approved = true;
+        } else if (eventType === 'jules.pull_request_observed') {
+            const owner = typeof value.pullRequestOwner === 'string' && /^[A-Za-z0-9_.-]{1,256}$/.test(value.pullRequestOwner) ? value.pullRequestOwner : undefined;
+            const repository = typeof value.pullRequestRepository === 'string' && /^[A-Za-z0-9_.-]{1,256}$/.test(value.pullRequestRepository) ? value.pullRequestRepository : undefined;
+            const number = Number.isSafeInteger(value.pullRequestNumber) && value.pullRequestNumber > 0 ? value.pullRequestNumber : undefined;
+            if (owner) safe.pullRequestOwner = owner;
+            if (repository) safe.pullRequestRepository = repository;
+            if (number) safe.pullRequestNumber = number;
+            if (owner && repository && number && typeof value.pullRequestUrl === 'string' && Buffer.byteLength(value.pullRequestUrl, 'utf8') <= 2048) {
+                try {
+                    const url = new URL(value.pullRequestUrl);
+                    if (url.protocol === 'https:' && !url.port && !url.username && !url.password && !url.search && !url.hash && url.hostname.toLowerCase() === 'github.com' && url.pathname === `/${owner}/${repository}/pull/${number}`) {
+                        safe.pullRequestUrl = url.toString();
+                    }
+                } catch { /* omit invalid URL */ }
+            }
+        } else if (eventType === 'jules.request_failed') {
+            if (typeof value.operation === 'string' && [
+                'sources.list', 'session.create', 'session.get', 'plan.approve', 'activities.list'
+            ].includes(value.operation)) safe.operation = value.operation;
+            if (typeof value.code === 'string' && JULES_ERROR_CODES.has(value.code)) safe.code = value.code;
+        }
+        return safe;
     }
     return projected;
 }
@@ -469,14 +523,20 @@ function safeLogPayload(eventType: string, value: any): Record<string, any> {
     const safe: Record<string, any> = {};
     const idFields = new Set(['runId', 'intentId', 'nodeId', 'stepId', 'detachedRunId', 'correlationId']);
     const numberFields = new Set([
-        'index', 'timestamp', 'totalSteps', 'completedSteps', 'checkpointEveryNodes', 'textLength'
+        'index', 'timestamp', 'totalSteps', 'completedSteps', 'checkpointEveryNodes', 'textLength',
+        'pullRequestNumber'
     ]);
-    const booleanFields = new Set(['success', 'dryRun']);
+    const booleanFields = new Set(['success', 'dryRun', 'approved']);
     const enumFields: Record<string, Set<string>> = {
         stream: new Set(['stdout', 'stderr']),
         action: new Set(['pause', 'resume', 'cancel']),
         status: new Set(['starting', 'running', 'pause_requested', 'paused', 'cancel_requested', 'success', 'failure', 'cancelled', 'detached'])
     };
+    const julesStates = new Set([
+        'STATE_UNSPECIFIED', 'QUEUED', 'PLANNING', 'AWAITING_PLAN_APPROVAL',
+        'AWAITING_USER_FEEDBACK', 'IN_PROGRESS', 'PAUSED', 'FAILED', 'COMPLETED'
+    ]);
+    const julesOperations = new Set(['sources.list', 'session.create', 'session.get', 'plan.approve', 'activities.list']);
     for (const [key, entry] of Object.entries(projected)) {
         if (numberFields.has(key)) {
             if (typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0) safe[key] = entry;
@@ -496,10 +556,26 @@ function safeLogPayload(eventType: string, value: any): Record<string, any> {
             continue;
         }
         if (key === 'code') {
-            if (LOG_CODE_PATTERN.test(entry)) safe[key] = entry;
+            if (LOG_CODE_PATTERN.test(entry) && (eventType !== 'jules.request_failed' || JULES_ERROR_CODES.has(entry))) safe[key] = entry;
             continue;
         }
         if (key === 'textSha256' && /^[a-f0-9]{64}$/.test(entry)) safe[key] = entry;
+        if (key === 'sessionId' && /^[A-Za-z0-9._~-]{1,255}$/.test(entry)) safe[key] = entry;
+        if ((key === 'pullRequestOwner' || key === 'pullRequestRepository') && /^[A-Za-z0-9_.-]{1,256}$/.test(entry)) safe[key] = entry;
+        if (key === 'state' && julesStates.has(entry)) safe[key] = entry;
+        if (key === 'operation' && julesOperations.has(entry)) safe[key] = entry;
+        if (key === 'sessionUrl') {
+            try {
+                const url = new URL(entry);
+                if (url.protocol === 'https:' && !url.port && !url.username && !url.password && !url.search && !url.hash && url.hostname.toLowerCase() === 'jules.google.com' && /^\/session\/[A-Za-z0-9._~-]+$/.test(url.pathname)) safe[key] = url.toString();
+            } catch { /* omit invalid URL */ }
+        }
+        if (key === 'pullRequestUrl') {
+            try {
+                const url = new URL(entry);
+                if (url.protocol === 'https:' && !url.port && !url.username && !url.password && !url.search && !url.hash && url.hostname.toLowerCase() === 'github.com' && /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+$/.test(url.pathname)) safe[key] = url.toString();
+            } catch { /* omit invalid URL */ }
+        }
     }
     return safe;
 }
