@@ -1,4 +1,5 @@
 import { builtinCapabilityRegistrations } from './builtinCapabilities';
+import { policyCapabilities } from './policyCapability';
 import { CapabilityArgument } from './types';
 
 export const PROTOCOL_VERSION = '1';
@@ -26,12 +27,16 @@ export type CapabilityDescriptor = {
 };
 
 // Some legacy builder arguments are labelled "string", while their runtime
-// implementations explicitly consume arrays. Preserve that original metadata
-// and publish the proven JSON input types used by static validation separately.
+// implementations explicitly consume arrays/objects. Preserve that original
+// metadata and publish the proven JSON input types used by static validation separately.
 const acceptedTypes: Record<string, Record<string, string[]>> = {
     'system.form': { fields: ['array'] },
     'system.switch': { routes: ['array'] },
     'system.loop': { items: ['string', 'array'], graphStepIds: ['array'] },
+    'system.policy.check': {
+        subject: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+        rules: ['array']
+    },
     'ai.generate': { contextFiles: ['array'], agentSpecFiles: ['array'] },
     'ai.team': { members: ['array'], contextFiles: ['string', 'array'], agentSpecFiles: ['string', 'array'] },
     'memory.save': { data: ['string', 'number', 'boolean', 'object', 'array', 'null'] }
@@ -41,6 +46,9 @@ function executionFacts(capability: string): Pick<CapabilityDescriptor, 'host' |
     const unknown = { host: 'cli', executionMode: 'provider', risk: 'unknown', requirements: 'unknown' as const, available: 'unknown' as const };
     if (['system.setVar', 'system.setCwd', 'system.switch'].includes(capability)) {
         return { host: 'cli', executionMode: 'runner', risk: 'none', requirements: [], available: true };
+    }
+    if (capability === 'system.policy.check') {
+        return { host: 'cli', executionMode: 'provider', risk: 'none', requirements: [], available: true };
     }
     if (capability === 'system.form' || capability === 'system.pause') {
         return { host: 'cli', executionMode: capability === 'system.form' ? 'runner' : 'provider', risk: 'human-input', requirements: ['interactive-tty'], available: 'unknown' };
@@ -75,7 +83,7 @@ export function getRuntimeCapabilities(): CapabilityDescriptor[] {
         description: 'Pipeline container and inline composite intent supported by the runner/router',
         host: 'cli', executionMode: 'composite', risk: 'unknown', requirements: [], available: true
     }];
-    for (const registration of builtinCapabilityRegistrations) {
+    for (const registration of [...builtinCapabilityRegistrations, policyCapabilities]) {
         for (const entry of registration.capabilities) {
             if (typeof entry === 'string') continue;
             descriptors.push({
