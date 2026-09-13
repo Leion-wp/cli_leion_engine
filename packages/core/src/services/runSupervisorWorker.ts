@@ -5,6 +5,7 @@ import { CoreRuntime } from '../coreRuntime';
 import { pipelineEventBus } from '../eventBus';
 import {
     appendEventRecord,
+    cancelFilePath,
     ctrlFilePath,
     eventsFilePath,
     projectRunResult,
@@ -127,6 +128,7 @@ async function main(): Promise<void> {
     const args = parseArgs(process.argv.slice(2));
     const statePath = stateFilePath(args.workspaceRoot, args.runId);
     const controlPath = ctrlFilePath(args.workspaceRoot, args.runId);
+    const cancellationPath = cancelFilePath(args.workspaceRoot, args.runId);
     const eventsPath = eventsFilePath(args.workspaceRoot, args.runId);
 
     const loadedState = safeReadJson(statePath) as DetachedRunState | undefined;
@@ -219,20 +221,27 @@ async function main(): Promise<void> {
         dryRun: args.dryRun
     }, args.runId);
 
-    let pauseRequested = state.pauseRequested === true;
-    let pauseApplied = state.status === 'paused';
-    let cancelRequested = state.cancelRequested === true;
+    let cancelRequested = state.cancelRequested === true || fs.existsSync(cancellationPath);
+    let pauseRequested = !cancelRequested && (state.pauseRequested === true || state.status === 'pause_requested');
+    let pauseApplied = !cancelRequested && state.status === 'paused';
     let rootRunId = String(state.pipelineRunId || '').trim() || undefined;
     let completedSteps = 0;
-    let lastControlRequestId = '';
+    let lastControlRequestId = String(state.lastControlRequestId || '').trim();
 
-    const writeState = (patch?: Partial<DetachedRunState>) => {
+    const writeState = (patch?: Partial<DetachedRunState>): boolean => {
+        if (['success', 'failure', 'cancelled'].includes(state.status)) return false;
+        const durableState = safeReadJson(statePath) as DetachedRunState | undefined;
+        if (durableState && ['success', 'failure', 'cancelled'].includes(durableState.status)) {
+            state = durableState;
+            return false;
+        }
         state = {
             ...state,
             ...(patch || {}),
             updatedAt: Date.now()
         };
         writeJsonFile(statePath, state);
+        return true;
     };
 
     const subscription = pipelineEventBus.on((event: any) => {
@@ -242,14 +251,26 @@ async function main(): Promise<void> {
         if (event?.type === 'pipelineStart') {
             if (rootRunId && eventRunId !== rootRunId) return;
             rootRunId = eventRunId || rootRunId;
-            writeState({
-                pipelineRunId: rootRunId || state.pipelineRunId,
-                status: 'running'
-            });
             if (cancelRequested && rootRunId) {
+                writeState({
+                    pipelineRunId: rootRunId,
+                    pauseRequested: false,
+                    cancelRequested: true,
+                    status: 'cancel_requested'
+                });
                 runtime.cancel(rootRunId);
             } else if (pauseRequested && rootRunId) {
+                writeState({
+                    pipelineRunId: rootRunId,
+                    pauseRequested: true,
+                    status: 'pause_requested'
+                });
                 runtime.pause(rootRunId);
+            } else {
+                writeState({
+                    pipelineRunId: rootRunId || state.pipelineRunId,
+                    status: 'running'
+                });
             }
             return;
         }
@@ -259,25 +280,32 @@ async function main(): Promise<void> {
         if (event?.type === 'stepEnd') {
             completedSteps += 1;
             const checkpointEveryNodes = toPositiveInt(state.checkpointEveryNodes, 1);
+            if (cancelRequested) {
+                runtime.cancel(rootRunId);
+                return;
+            }
             if (pauseRequested && !pauseApplied && completedSteps % checkpointEveryNodes === 0) {
                 const targetRunId = String(state.pipelineRunId || args.runId).trim();
                 runtime.pause(targetRunId);
-                pauseApplied = true;
-                pauseRequested = false;
-                writeState({
-                    pauseRequested: false,
-                    status: 'paused'
-                });
-                appendEvent('run.paused_checkpoint', {
-                    stepId: String(event?.stepId || '').trim() || undefined,
-                    completedSteps,
-                    checkpointEveryNodes
-                }, targetRunId);
+                // CoreRuntime emits pipelinePause synchronously when it has
+                // actually stopped between nodes. Only that event publishes
+                // the durable paused state.
+                if (pauseApplied && !cancelRequested) {
+                    appendEvent('run.paused_checkpoint', {
+                        stepId: String(event?.stepId || '').trim() || undefined,
+                        completedSteps,
+                        checkpointEveryNodes
+                    }, targetRunId);
+                }
             }
             return;
         }
 
         if (event?.type === 'pipelinePause') {
+            if (cancelRequested) {
+                runtime.cancel(rootRunId);
+                return;
+            }
             pauseApplied = true;
             pauseRequested = false;
             writeState({
@@ -288,8 +316,12 @@ async function main(): Promise<void> {
         }
 
         if (event?.type === 'pipelineResume') {
+            if (cancelRequested) {
+                runtime.cancel(rootRunId);
+                return;
+            }
             pauseApplied = false;
-            writeState({ status: 'running' });
+            writeState({ pauseRequested: false, status: 'running' });
             return;
         }
 
@@ -298,28 +330,73 @@ async function main(): Promise<void> {
         // returns, so a terminal-state observer can drain a complete journal.
     });
 
+    const applyCancellation = (control: any) => {
+        if (['success', 'failure', 'cancelled'].includes(state.status)) return;
+        const updatedAt = Number(control?.updatedAt || 0);
+        const requestId = String(control?.requestId || '').trim();
+        const requestIdentity = requestId || `${updatedAt}:cancel`;
+        const firstApplication = !cancelRequested || state.status !== 'cancel_requested';
+        cancelRequested = true;
+        pauseRequested = false;
+        pauseApplied = false;
+        if (requestIdentity) lastControlRequestId = requestIdentity;
+        writeState({
+            pauseRequested: false,
+            cancelRequested: true,
+            status: 'cancel_requested',
+            lastControl: 'cancel',
+            ...(lastControlRequestId ? { lastControlRequestId } : {})
+        });
+        const targetRunId = String(rootRunId || args.runId).trim();
+        if (firstApplication) {
+            appendEvent('run.cancel_requested', { action: 'cancel' }, targetRunId);
+        }
+        if (rootRunId) runtime.cancel(rootRunId);
+    };
+
     const processPendingControl = () => {
-        if (!fs.existsSync(controlPath)) {
+        // This write-once marker is checked first. It makes cancellation
+        // dominant even if a concurrent pause/resume replaces ctrl.json.
+        const durableCancellation = fs.existsSync(cancellationPath)
+            ? safeReadJson(cancellationPath)
+            : undefined;
+        if (durableCancellation || cancelRequested || state.cancelRequested === true) {
+            applyCancellation(durableCancellation || { requestId: state.lastControlRequestId, updatedAt: state.updatedAt });
             return;
         }
+        if (!fs.existsSync(controlPath)) return;
+
         const control = safeReadJson(controlPath);
         const updatedAt = Number(control?.updatedAt || 0);
         const requestId = String(control?.requestId || '').trim();
-        const requestIdentity = requestId || `${updatedAt}:${String(control?.action || '').trim()}`;
-        if (!requestIdentity || requestIdentity === lastControlRequestId) {
-            return;
-        }
-        lastControlRequestId = requestIdentity;
-        if (['success', 'failure', 'cancelled'].includes(state.status)) return;
         const action = String(control?.action || '').trim();
+        const requestIdentity = requestId || `${updatedAt}:${action}`;
+        if (!requestIdentity || requestIdentity === lastControlRequestId) return;
+        if (['success', 'failure', 'cancelled'].includes(state.status)) return;
         const targetRunId = String(rootRunId || args.runId).trim();
 
+        if (action === 'cancel' || action === 'stop') {
+            applyCancellation(control);
+            return;
+        }
         if (action === 'pause') {
+            lastControlRequestId = requestIdentity;
+            if (pauseApplied || state.status === 'paused') {
+                pauseRequested = false;
+                writeState({
+                    pauseRequested: false,
+                    status: 'paused',
+                    lastControl: 'pause',
+                    lastControlRequestId
+                });
+                return;
+            }
             pauseRequested = true;
             writeState({
                 pauseRequested: true,
                 status: 'pause_requested',
-                lastControl: 'pause'
+                lastControl: 'pause',
+                lastControlRequestId
             });
             appendEvent('run.pause_requested', {
                 action: 'pause',
@@ -328,31 +405,38 @@ async function main(): Promise<void> {
             return;
         }
         if (action === 'resume') {
+            lastControlRequestId = requestIdentity;
             pauseRequested = false;
+            appendEvent('run.resume_requested', { action: 'resume' }, targetRunId);
+            if (pauseApplied && rootRunId) {
+                // Keep the public state paused until pipelineResume confirms
+                // that the runner has actually woken up.
+                writeState({
+                    pauseRequested: false,
+                    status: 'paused',
+                    lastControl: 'resume',
+                    lastControlRequestId
+                });
+                runtime.resume(rootRunId);
+                return;
+            }
             pauseApplied = false;
-            if (rootRunId) runtime.resume(rootRunId);
             writeState({
                 pauseRequested: false,
-                status: 'running',
-                lastControl: 'resume'
+                status: rootRunId ? 'running' : 'starting',
+                lastControl: 'resume',
+                lastControlRequestId
             });
-            appendEvent('run.resume_requested', { action: 'resume' }, targetRunId);
-            return;
-        }
-        if (action === 'cancel' || action === 'stop') {
-            cancelRequested = true;
-            if (rootRunId) runtime.cancel(rootRunId);
-            writeState({
-                cancelRequested: true,
-                status: 'cancel_requested',
-                lastControl: 'cancel'
-            });
-            appendEvent('run.cancel_requested', { action: 'cancel' }, targetRunId);
         }
     };
 
     processPendingControl();
     const timer = setInterval(processPendingControl, 250);
+    const cancellationIsDurable = () => (
+        cancelRequested
+        || state.cancelRequested === true
+        || fs.existsSync(cancellationPath)
+    );
 
     try {
         if (cancelRequested) {
@@ -370,26 +454,49 @@ async function main(): Promise<void> {
             dryRun: args.dryRun,
             from: args.from
         });
-        const nextStatus: RunStatus = state.cancelRequested
+        const nextStatus: RunStatus = result?.status === 'cancelled'
             ? 'cancelled'
-            : (result?.status === 'cancelled'
-                ? 'cancelled'
-                : (result?.success ? 'success' : 'failure'));
+            : (result?.success ? 'success' : 'failure');
+        // This is the terminal-transition linearization point. It closes the
+        // window after the last timer poll while preserving event-before-state
+        // ordering for observers.
+        const finalStatus: RunStatus = cancellationIsDurable() ? 'cancelled' : nextStatus;
         appendEvent('run.worker_finished', {
-            status: nextStatus,
-            success: result?.success === true
+            status: finalStatus,
+            success: finalStatus === 'success'
         }, String(result?.runId || state.pipelineRunId || args.runId));
         writeState({
-            status: nextStatus,
-            result: projectRunResult(result),
+            status: finalStatus,
+            cancelRequested: finalStatus === 'cancelled' ? true : state.cancelRequested,
+            result: finalStatus === 'cancelled'
+                ? { ...(result?.runId ? { runId: String(result.runId) } : {}), success: false, status: 'cancelled' }
+                : projectRunResult(result),
             endedAt: Date.now()
         });
-        process.exitCode = nextStatus === 'success' ? 0 : 1;
+        process.exitCode = finalStatus === 'success' ? 0 : 1;
     } catch (error: any) {
+        if (cancellationIsDurable()) {
+            appendEvent('run.worker_finished', { status: 'cancelled', success: false }, state.pipelineRunId || args.runId);
+            writeState({
+                status: 'cancelled',
+                pauseRequested: false,
+                cancelRequested: true,
+                errorCode: undefined,
+                error: undefined,
+                result: {
+                    ...(state.pipelineRunId ? { runId: state.pipelineRunId } : {}),
+                    success: false,
+                    status: 'cancelled'
+                },
+                endedAt: Date.now()
+            });
+            process.exitCode = 1;
+            return;
+        }
         const sanitizedError = sanitizeWorkerError(error);
         appendEvent('run.worker_error', { code: sanitizedError.code }, state.pipelineRunId || args.runId);
         writeState({
-            status: state.cancelRequested ? 'cancelled' : 'failure',
+            status: 'failure',
             errorCode: sanitizedError.code,
             error: sanitizedError.message,
             result: undefined,

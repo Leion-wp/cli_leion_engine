@@ -1,6 +1,7 @@
 import { terminalCapabilities } from '../builtinCapabilities';
 import * as vscode from '../ports/vscodeShim';
 import * as cp from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import { pipelineEventBus } from '../eventBus';
 import { registerCapabilities } from '../registry';
@@ -24,6 +25,7 @@ let sharedPtyWriteEmitter: vscode.EventEmitter<string> | undefined;
 let sharedTerminal: vscode.Terminal | undefined;
 
 const runningProcessesByRunId = new Map<string, Set<cp.ChildProcess>>();
+const cancellationFallbacks = new WeakMap<cp.ChildProcess, NodeJS.Timeout[]>();
 
 function getOrCreateTerminal(): { terminal: vscode.Terminal, write: (data: string) => void } {
     if (!sharedTerminal) {
@@ -151,12 +153,48 @@ export function cancelTerminalRun(runId: string | undefined | null): void {
         if (!child.pid) {
             continue;
         }
+        if (cancellationFallbacks.has(child)) continue;
 
         try {
             if (process.platform === 'win32') {
-                cp.spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+                const systemTaskkill = path.join(
+                    String(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows'),
+                    'System32',
+                    'taskkill.exe'
+                );
+                const taskkillCommand = fs.existsSync(systemTaskkill) ? systemTaskkill : 'taskkill';
+                const launchTaskkill = () => {
+                    const taskkill = cp.spawn(
+                        taskkillCommand,
+                        ['/PID', String(child.pid), '/T', '/F'],
+                        { stdio: 'ignore' }
+                    );
+                    taskkill.on('error', () => {
+                        try { child.kill(); } catch { /* process already stopped */ }
+                    });
+                    taskkill.on('close', (code) => {
+                        if (code === 0) return;
+                        try { child.kill(); } catch { /* process already stopped */ }
+                    });
+                };
+                launchTaskkill();
+                const retryTreeKill = setTimeout(launchTaskkill, 2000);
+                const fallback = setTimeout(() => {
+                    try { child.kill(); } catch { /* process already stopped */ }
+                }, 8000);
+                cancellationFallbacks.set(child, [retryTreeKill, fallback]);
             } else {
-                child.kill('SIGTERM');
+                // Capture-mode commands run in their own process group so the
+                // shell and any command it launched stop together.
+                try {
+                    process.kill(-child.pid, 'SIGTERM');
+                } catch {
+                    child.kill('SIGTERM');
+                }
+                const fallback = setTimeout(() => {
+                    try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* process group already stopped */ }
+                }, 2000);
+                cancellationFallbacks.set(child, [fallback]);
             }
         } catch {
             // Best-effort cancellation.
@@ -185,9 +223,18 @@ function runCommand(command: string, cwd: string | undefined, runId: string, int
             }
         }
 
+        const systemPowerShell = path.join(
+            String(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows'),
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe'
+        );
+        const windowsShell = fs.existsSync(systemPowerShell) ? systemPowerShell : 'powershell.exe';
+        const windowsCommand = `$ErrorActionPreference = 'Stop'; & { ${command} }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`;
         const child = (process.platform === 'win32')
-            ? cp.spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], { cwd: safeCwd, env })
-            : cp.spawn(command, { cwd: safeCwd, env, shell: true });
+            ? cp.spawn(windowsShell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', windowsCommand], { cwd: safeCwd, env })
+            : cp.spawn(command, { cwd: safeCwd, env, shell: true, detached: true });
 
         const running = runningProcessesByRunId.get(runId) ?? new Set<cp.ChildProcess>();
         running.add(child);
@@ -220,6 +267,9 @@ function runCommand(command: string, cwd: string | undefined, runId: string, int
         });
 
         const cleanup = () => {
+            const cancellationFallback = cancellationFallbacks.get(child);
+            for (const timer of cancellationFallback || []) clearTimeout(timer);
+            cancellationFallbacks.delete(child);
             const active = runningProcessesByRunId.get(runId);
             if (!active) {
                 return;
