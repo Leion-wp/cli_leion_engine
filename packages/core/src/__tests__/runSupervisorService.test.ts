@@ -44,6 +44,16 @@ function createWorkspace(): string {
     return workspace;
 }
 
+function createApprovedBundle(workspace: string, planId = 'plan_approved'): string {
+    const bundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', planId);
+    fs.mkdirSync(bundleDirectory, { recursive: true });
+    const serialized = JSON.stringify({ name: 'approved', steps: [] });
+    const revision = createHash('sha256').update(serialized).digest('hex');
+    const bundlePath = path.join(bundleDirectory, `${revision}.intent.json`);
+    fs.writeFileSync(bundlePath, serialized, 'utf8');
+    return fs.realpathSync.native(bundlePath);
+}
+
 function fakeSpawn(pid: number, onSpawn: () => void = () => {}): typeof cp.spawn {
     return ((..._args: any[]) => {
         onSpawn();
@@ -240,6 +250,71 @@ test('correlation retry returns the same run and resolves status, logs, and cont
     assert.equal(serializedRuns.includes('"secrets"'), false);
     const claimPath = correlationClaimFilePath(workspace, 'delivery:42:attempt-1');
     assert.equal(path.basename(claimPath).includes('delivery'), false);
+});
+
+test('start_detached accepts an immutable approved control-plane bundle', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const bundlePath = createApprovedBundle(workspace);
+    let spawnedArgs: readonly string[] = [];
+    const supervisor = new RunSupervisorService(workspace, {
+        spawn: ((command: string, args: readonly string[]) => {
+            assert.equal(command, process.execPath);
+            spawnedArgs = args;
+            return { pid: 41101, unref() { /* test double */ } } as cp.ChildProcess;
+        }) as typeof cp.spawn,
+        isProcessAlive: (pid) => pid === 41101
+    });
+
+    const started = supervisor.start_detached({
+        pipeline: bundlePath,
+        dryRun: true,
+        correlationId: 'approved-bundle'
+    });
+
+    assert.equal(started.reused, false);
+    assert.equal(spawnedArgs[spawnedArgs.indexOf('--pipeline_path') + 1], bundlePath);
+    const state = supervisor.show_run(started.run_id);
+    assert.equal(state?.pipelinePath, bundlePath);
+    assert.equal(state?.pipelineHash, createHash('sha256').update(fs.readFileSync(bundlePath)).digest('hex'));
+});
+
+test('start_detached rejects files outside both source roots and malformed bundle paths', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const outside = path.join(workspace, 'private.intent.json');
+    fs.writeFileSync(outside, JSON.stringify({ name: 'private', steps: [] }), 'utf8');
+    const arbitraryLeiokDirectory = path.join(workspace, '.leiok', 'other');
+    fs.mkdirSync(arbitraryLeiokDirectory, { recursive: true });
+    const arbitraryLeiok = path.join(arbitraryLeiokDirectory, 'private.intent.json');
+    fs.writeFileSync(arbitraryLeiok, JSON.stringify({ name: 'private', steps: [] }), 'utf8');
+    const malformedBundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', 'plan_approved');
+    fs.mkdirSync(malformedBundleDirectory, { recursive: true });
+    const malformedBundle = path.join(malformedBundleDirectory, 'not-a-hash.intent.json');
+    fs.writeFileSync(malformedBundle, JSON.stringify({ name: 'private', steps: [] }), 'utf8');
+    const supervisor = new RunSupervisorService(workspace, { spawn: fakeSpawn(41102) });
+
+    for (const pipeline of [outside, arbitraryLeiok, malformedBundle]) {
+        assert.throws(
+            () => supervisor.start_detached({ pipeline, dryRun: true }),
+            (error: unknown) => error instanceof RunSupervisorError && error.code === 'PATH_OUTSIDE_PIPELINE'
+        );
+    }
+    assert.deepEqual(supervisor.list_runs(), []);
+});
+
+test('start_detached rejects approved bundle bytes that do not match the filename before creating run state', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const bundlePath = createApprovedBundle(workspace, 'plan_tampered');
+    fs.writeFileSync(bundlePath, JSON.stringify({ name: 'tampered', steps: [] }), 'utf8');
+    const supervisor = new RunSupervisorService(workspace, { spawn: fakeSpawn(41103) });
+
+    assert.throws(
+        () => supervisor.start_detached({ pipeline: bundlePath, dryRun: true }),
+        (error: unknown) => error instanceof RunSupervisorError && error.code === 'PIPELINE_HASH_MISMATCH'
+    );
+    assert.deepEqual(supervisor.list_runs(), []);
 });
 
 test('correlation conflict has a stable code for immutable parameter divergence', (t) => {
@@ -705,6 +780,57 @@ test('worker rejects changed pipeline bytes before constructing CoreRuntime', (t
     assert.equal(failed.errorCode, 'RUN_PIPELINE_CHANGED');
     assert.equal(failed.error, 'Pipeline content changed before execution.');
     assert.equal(fs.existsSync(executionClaimFilePath(workspace, runId)), true);
+});
+
+test('worker rechecks approved bundle confinement before hashing or constructing CoreRuntime', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const pipelinePath = createApprovedBundle(workspace, 'plan_redirected');
+    const revision = path.basename(pipelinePath, '.intent.json');
+    const pipelineBytes = fs.readFileSync(pipelinePath);
+    const pipelineHash = createHash('sha256').update(pipelineBytes).digest('hex');
+    const runId = 'run_bundle_redirected_test';
+    const state: DetachedRunState = {
+        detachedRunId: runId,
+        correlationId: 'bundle-redirected',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: pipelinePath,
+        pipelinePath,
+        pipelineHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, runId), state);
+
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'leion-bundle-outside-'));
+    t.after(() => removeWorkspace(outside));
+    fs.writeFileSync(path.join(outside, `${revision}.intent.json`), pipelineBytes);
+    const planDirectory = path.dirname(pipelinePath);
+    fs.rmSync(planDirectory, { recursive: true });
+    fs.symlinkSync(outside, planDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const preloadPath = path.join(workspace, 'no-redirected-runtime.cjs');
+    const runtimeModule = path.resolve(__dirname, '..', 'coreRuntime.js');
+    fs.writeFileSync(preloadPath, `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class { constructor() { throw new Error('RUNTIME_CONSTRUCTED'); } };`, 'utf8');
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const result = cp.spawnSync(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', runId,
+        '--pipeline', pipelinePath,
+        '--pipeline_path', pipelinePath,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.status, 1);
+    assert.doesNotMatch(result.stderr, /RUNTIME_CONSTRUCTED/);
+    const failed = JSON.parse(fs.readFileSync(stateFilePath(workspace, runId), 'utf8'));
+    assert.equal(failed.status, 'failure');
+    assert.equal(failed.errorCode, 'RUN_PIPELINE_CHANGED');
 });
 
 test('worker holds execution claim and spawn handoff before publishing a pipeline hash failure', async (t) => {

@@ -61,22 +61,6 @@ function getWorkspaceRoot(flags: Record<string, string | boolean>): string {
     return process.cwd();
 }
 
-function resolvePipelineRuntimePath(workspaceRoot: string, pipelineRef: string): string {
-    const raw = String(pipelineRef || '').trim();
-    if (!raw) {
-        throw new Error('Pipeline reference is required.');
-    }
-    const withExt = raw.endsWith('.intent.json') ? raw : `${raw}.intent.json`;
-    if (path.isAbsolute(withExt)) {
-        return path.resolve(withExt);
-    }
-    const hasDirectory = withExt.includes('/') || withExt.includes('\\');
-    if (hasDirectory) {
-        return path.resolve(workspaceRoot, withExt);
-    }
-    return path.resolve(workspaceRoot, 'pipeline', withExt);
-}
-
 function asBool(value: string | boolean | undefined): boolean {
     if (value === true) return true;
     const raw = String(value || '').trim().toLowerCase();
@@ -289,7 +273,7 @@ async function runWorker(flags: Record<string, string | boolean>): Promise<void>
     const verbose = asBool(flags.verbose);
     const detachedRunId = String(flags.run_id || '').trim();
     const pipeline = String(flags.pipeline || '').trim();
-    const pipelinePath = resolvePipelineRuntimePath(workspaceRoot, pipeline);
+    const pipelinePath = core.resolvePipelineSourcePath(workspaceRoot, pipeline);
     const from = String(flags.from || '').trim() || undefined;
     const dryRun = asBool(flags.dry_run);
 
@@ -382,7 +366,7 @@ async function handleRunPipeline(workspaceRoot: string, flags: Record<string, st
     if (!pipeline) {
         throw Object.assign(new Error('run_pipeline requires --pipeline'), { code: 'PIPELINE_REQUIRED' });
     }
-    const pipelinePath = resolvePipelineRuntimePath(workspaceRoot, pipeline);
+    const pipelinePath = core.resolvePipelineSourcePath(workspaceRoot, pipeline);
 
     if (!detached) {
         if (correlationId) {

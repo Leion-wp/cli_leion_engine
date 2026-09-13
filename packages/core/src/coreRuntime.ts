@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { readPipelineSource } from './pipelineSource';
 import {
     CoreHostPorts,
     Uri,
@@ -227,13 +228,10 @@ export class CoreRuntime {
     }
 
     async run_pipeline_file(pipelinePath: string, options: RunPipelineOptions = {}): Promise<any> {
-        const resolved = path.isAbsolute(pipelinePath)
-            ? path.resolve(pipelinePath)
-            : path.resolve(this.workspaceRoot, pipelinePath);
-        const pipeline = await this.loaded.readPipelineFromUri(Uri.file(resolved));
-        if (!pipeline) {
-            throw new Error(`Unable to read pipeline: ${resolved}`);
-        }
+        const source = readPipelineSource(this.workspaceRoot, pipelinePath);
+        let pipeline: any;
+        try { pipeline = JSON.parse(source.bytes.toString('utf8')); } catch { /* handled below */ }
+        if (!pipeline || !Array.isArray(pipeline.steps)) throw new Error(`Unable to read pipeline: ${source.path}`);
         return await this.run_pipeline_data(pipeline, options);
     }
 

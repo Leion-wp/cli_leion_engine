@@ -6,6 +6,7 @@ const { test } = require('node:test');
 const { workspace, step } = require('./runtime-fixture.cjs');
 const { getRuntimeCapabilities, describeRuntime, PROTOCOL_COMMANDS } = require('../packages/core/out/runtimeCatalog');
 const { validatePipelineData } = require('../packages/core/out/validatePipeline');
+const { resolvePipelineSourcePath } = require('../packages/core/out/pipelineSource');
 const registry = require('../packages/core/out/registry');
 const { builtinCapabilityRegistrations } = require('../packages/core/out/builtinCapabilities');
 
@@ -78,6 +79,16 @@ test('catalog preserves shared registration descriptors and exposes conservative
   const envelope = describeRuntime('fixture-version');
   assert.equal(envelope.runtime.version, 'fixture-version');
   assert.deepEqual(envelope.runtime.capabilities, PROTOCOL_COMMANDS);
+  assert.deepEqual(envelope.runtime.contracts.pipeline_inputs, {
+    version: '1',
+    authorRoot: 'pipeline',
+    approvedBundleRoot: '.leiok/execution-bundles',
+    absolutePathPolicy: 'allowed_roots_only',
+    regularFileRequired: true,
+    redirectedAncestors: 'confined_to_workspace',
+    validationExecutionParity: true,
+    approvedBundleFilenameSha256: true
+  });
   assert.equal(envelope.runtime.contracts.run_logs.cursorFormat, 'lr1');
   assert.equal(envelope.runtime.contracts.run_logs.eventVersion, 1);
   assert.deepEqual(envelope.runtime.contracts.run_controls, {
@@ -117,18 +128,109 @@ test('describe and catalog return directly parsable protocol JSON without runtim
 test('validation reads a named, relative or absolute in-pipeline file without any execution', (t) => {
   const f = cli(t);
   const file = f.write(validPipeline());
+  const canonicalFile = fs.realpathSync.native(file);
   const before = fs.readFileSync(file, 'utf8');
   for (const reference of ['proof', 'pipeline/proof.intent.json', file]) {
     const { json } = f.run(['validate_pipeline', '--pipeline', reference]);
     assert.equal(json.ok, true);
     assert.equal(json.valid, true);
     assert.equal(json.steps, 2);
-    assert.equal(json.path, fs.realpathSync(file));
+    assert.equal(json.path, canonicalFile);
     assert.deepEqual(json.diagnostics, []);
   }
   assert.equal(fs.readFileSync(file, 'utf8'), before);
   assert.deepEqual(fs.readdirSync(path.join(f.root, 'pipeline')), ['proof.intent.json']);
   assert.equal(fs.existsSync(path.join(f.root, '.intent-router')), false);
+  assert.equal(resolvePipelineSourcePath(f.root, canonicalFile), canonicalFile);
+});
+
+test('validation accepts only canonical approved control-plane bundle paths', (t) => {
+  const f = cli(t);
+  const planId = 'plan_approved-1';
+  const serialized = JSON.stringify(validPipeline());
+  const revision = require('node:crypto').createHash('sha256').update(serialized).digest('hex');
+  const bundleDir = path.join(f.root, '.leiok', 'execution-bundles', planId);
+  fs.mkdirSync(bundleDir, { recursive: true });
+  const bundle = path.join(bundleDir, `${revision}.intent.json`);
+  fs.writeFileSync(bundle, serialized);
+
+  for (const reference of [
+    `.leiok/execution-bundles/${planId}/${revision}.intent.json`,
+    bundle
+  ]) {
+    const { json } = f.run(['validate_pipeline', '--pipeline', reference]);
+    assert.equal(json.ok, true);
+    assert.equal(json.valid, true);
+    assert.equal(json.path, fs.realpathSync.native(bundle));
+  }
+
+  fs.writeFileSync(bundle, JSON.stringify({ ...validPipeline(), name: 'tampered-after-publication' }));
+  const { json: tampered } = f.run(['validate_pipeline', '--pipeline', bundle], 1);
+  assert.equal(tampered.diagnostics[0].code, 'PIPELINE_HASH_MISMATCH');
+
+  const arbitraryDir = path.join(f.root, '.leiok', 'other');
+  fs.mkdirSync(arbitraryDir, { recursive: true });
+  const arbitrary = path.join(arbitraryDir, 'private.intent.json');
+  fs.writeFileSync(arbitrary, JSON.stringify(validPipeline()));
+  for (const reference of [
+    arbitrary,
+    `.leiok/execution-bundles/${planId}/not-a-hash.intent.json`,
+    `.leiok/execution-bundles/nested/plan/${revision}.intent.json`,
+    `.leiok/execution-bundles/${revision}.intent.json`,
+    `.leiok/execution-bundles/plan:nonportable/${revision}.intent.json`,
+    `.leiok/execution-bundles/CON/${revision}.intent.json`,
+    `.leiok/execution-bundles/trailing./${revision}.intent.json`
+  ]) {
+    const { json } = f.run(['validate_pipeline', '--pipeline', reference], 1);
+    assert.equal(json.diagnostics[0].code, 'PATH_OUTSIDE_PIPELINE');
+  }
+});
+
+test('validation rejects an approved bundle junction escape before reading', (t) => {
+  const f = cli(t);
+  const outside = workspace(t);
+  const revision = 'b'.repeat(64);
+  fs.writeFileSync(path.join(outside, `${revision}.intent.json`), 'BUNDLE_SECRET_MUST_NOT_APPEAR');
+  const bundleRoot = path.join(f.root, '.leiok', 'execution-bundles');
+  fs.mkdirSync(bundleRoot, { recursive: true });
+  fs.symlinkSync(outside, path.join(bundleRoot, 'plan_escape'), process.platform === 'win32' ? 'junction' : 'dir');
+
+  const { json } = f.run([
+    'validate_pipeline',
+    '--pipeline',
+    `.leiok/execution-bundles/plan_escape/${revision}.intent.json`
+  ], 1);
+  assert.equal(json.diagnostics[0].code, 'PATH_OUTSIDE_PIPELINE');
+  assert.doesNotMatch(JSON.stringify(json), /BUNDLE_SECRET_MUST_NOT_APPEAR/);
+});
+
+test('an approved bundle root redirected outside the workspace is rejected', (t) => {
+  const f = cli(t);
+  const outside = workspace(t);
+  const revision = 'c'.repeat(64);
+  const outsidePlan = path.join(outside, 'plan_external');
+  fs.mkdirSync(outsidePlan, { recursive: true });
+  fs.writeFileSync(path.join(outsidePlan, `${revision}.intent.json`), JSON.stringify(validPipeline()));
+  const leiokRoot = path.join(f.root, '.leiok');
+  fs.mkdirSync(leiokRoot, { recursive: true });
+  fs.symlinkSync(outside, path.join(leiokRoot, 'execution-bundles'), process.platform === 'win32' ? 'junction' : 'dir');
+
+  const { json } = f.run([
+    'validate_pipeline',
+    '--pipeline',
+    `.leiok/execution-bundles/plan_external/${revision}.intent.json`
+  ], 1);
+  assert.equal(json.diagnostics[0].code, 'PATH_OUTSIDE_WORKSPACE');
+});
+
+test('attached execution rejects a pipeline path outside both source roots before runtime construction', (t) => {
+  const f = cli(t);
+  const outside = path.join(f.root, 'outside.intent.json');
+  fs.writeFileSync(outside, JSON.stringify(validPipeline()));
+
+  const { json } = f.run(['run_pipeline', '--pipeline', outside, '--dry_run'], 1);
+  assert.equal(json.ok, false);
+  assert.equal(json.diagnostics[0].code, 'PATH_OUTSIDE_PIPELINE');
 });
 
 test('invalid structure, IDs, capabilities, required args and basic types return localized JSON diagnostics', (t) => {
