@@ -16,6 +16,7 @@ import {
     RunSupervisorService,
     STARTING_STATUS_GRACE_MS,
     appendEventRecord,
+    cancelFilePath,
     correlationClaimFilePath,
     ctrlFilePath,
     eventsFilePath,
@@ -54,7 +55,7 @@ function fakeSpawn(pid: number, onSpawn: () => void = () => {}): typeof cp.spawn
 }
 
 function removeWorkspace(workspace: string): void {
-    fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
 }
 
 function waitForFiles(files: string[], timeoutMs = 5000): Promise<void> {
@@ -70,6 +71,55 @@ function waitForFiles(files: string[], timeoutMs = 5000): Promise<void> {
                 return;
             }
             setTimeout(poll, 10);
+        };
+        poll();
+    });
+}
+
+function waitForRunState(
+    workspace: string,
+    runId: string,
+    predicate: (state: DetachedRunState) => boolean,
+    timeoutMs = 10000
+): Promise<DetachedRunState> {
+    const filePath = stateFilePath(workspace, runId);
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = 'unreadable';
+    return new Promise((resolve, reject) => {
+        const poll = () => {
+            try {
+                const state = JSON.parse(fs.readFileSync(filePath, 'utf8')) as DetachedRunState;
+                lastStatus = state.status;
+                if (predicate(state)) {
+                    resolve(state);
+                    return;
+                }
+            } catch { /* keep polling during atomic replacement */ }
+            if (Date.now() >= deadline) {
+                reject(new Error(`Timed out waiting for run state: ${runId} (last status: ${lastStatus})`));
+                return;
+            }
+            setTimeout(poll, 10);
+        };
+        poll();
+    });
+}
+
+function waitForProcessExit(pid: number, timeoutMs = 10000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+        const poll = () => {
+            try {
+                process.kill(pid, 0);
+            } catch {
+                resolve();
+                return;
+            }
+            if (Date.now() >= deadline) {
+                reject(new Error(`Timed out waiting for process exit: ${pid}`));
+                return;
+            }
+            setTimeout(poll, 25);
         };
         poll();
     });
@@ -763,6 +813,289 @@ test('worker honors a cancel request present before runtime execution', (t) => {
     const cancelled = JSON.parse(fs.readFileSync(stateFilePath(workspace, runId), 'utf8'));
     assert.equal(cancelled.status, 'cancelled');
     assert.equal(cancelled.result.status, 'cancelled');
+});
+
+test('worker durably acknowledges pause and resume while cancellation wins later controls', async (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const runId = 'run_pause_state_machine';
+    const correlationId = 'pause-state-machine';
+    const pipelinePath = fs.realpathSync.native(path.join(workspace, 'pipeline', 'demo.intent.json'));
+    const pipelineHash = createHash('sha256').update(fs.readFileSync(pipelinePath)).digest('hex');
+    const state: DetachedRunState = {
+        detachedRunId: runId,
+        correlationId,
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: 'demo',
+        pipelinePath,
+        pipelineHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        checkpointEveryNodes: 1
+    };
+    writeJsonFile(stateFilePath(workspace, runId), state);
+    const readyPath = path.join(workspace, 'runtime-ready');
+    const pauseTargetPath = path.join(workspace, 'pause-target');
+    const resumeTargetPath = path.join(workspace, 'resume-target');
+    const cancelTargetPath = path.join(workspace, 'cancel-target');
+    const preloadPath = path.join(workspace, 'pause-runtime.cjs');
+    const runtimeModule = path.resolve(__dirname, '..', 'coreRuntime.js');
+    const eventBusModule = path.resolve(__dirname, '..', 'eventBus.js');
+    fs.writeFileSync(preloadPath, [
+        `const fs = require('fs');`,
+        `const bus = require(${JSON.stringify(eventBusModule)}).pipelineEventBus;`,
+        `const wait = ms => new Promise(resolve => setTimeout(resolve, ms));`,
+        `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
+        `  constructor() { this.paused = false; this.cancelled = false; }`,
+        `  async run_pipeline_data() {`,
+        `    bus.emit({ type: 'pipelineStart', runId: 'root-pause-state', timestamp: Date.now() });`,
+        `    fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
+        `    for (let index = 0; index < 500 && !this.cancelled; index += 1) {`,
+        `      await wait(10);`,
+        `      bus.emit({ type: 'stepEnd', runId: 'root-pause-state', stepId: 'step-' + index, timestamp: Date.now(), success: true });`,
+        `      while (this.paused && !this.cancelled) await wait(10);`,
+        `    }`,
+        `    const status = this.cancelled ? 'cancelled' : 'success';`,
+        `    bus.emit({ type: 'pipelineEnd', runId: 'root-pause-state', timestamp: Date.now(), success: status === 'success', status });`,
+        `    return { runId: 'root-pause-state', success: status === 'success', status };`,
+        `  }`,
+        `  pause(runId) {`,
+        `    fs.writeFileSync(${JSON.stringify(pauseTargetPath)}, String(runId));`,
+        `    if (!this.paused) { this.paused = true; bus.emit({ type: 'pipelinePause', runId, timestamp: Date.now() }); }`,
+        `  }`,
+        `  resume(runId) {`,
+        `    fs.writeFileSync(${JSON.stringify(resumeTargetPath)}, String(runId));`,
+        `    if (this.paused) setTimeout(() => { this.paused = false; bus.emit({ type: 'pipelineResume', runId, timestamp: Date.now() }); }, 100);`,
+        `  }`,
+        `  cancel(runId) {`,
+        `    fs.writeFileSync(${JSON.stringify(cancelTargetPath)}, String(runId));`,
+        `    this.cancelled = true; this.paused = false;`,
+        `  }`,
+        `};`
+    ].join('\n'), 'utf8');
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const child = cp.spawn(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', runId,
+        '--pipeline', 'demo',
+        '--pipeline_path', pipelinePath,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const exitPromise = waitForChildExit(child);
+    await waitForFiles([readyPath]);
+    await waitForRunState(workspace, runId, (entry) => entry.status === 'running');
+
+    const firstSupervisor = new RunSupervisorService(workspace);
+    assert.equal(firstSupervisor.pause_run(correlationId).detached_run_id, runId);
+    const paused = await waitForRunState(workspace, runId, (entry) => entry.status === 'paused');
+    assert.equal(paused.pauseRequested, false);
+    assert.equal(paused.lastControl, 'pause');
+    assert.ok(paused.lastControlRequestId);
+    assert.equal(fs.readFileSync(pauseTargetPath, 'utf8'), 'root-pause-state');
+
+    // A fresh supervisor instance observes the durable acknowledgement and an
+    // idempotent repeated pause does not replace the control request.
+    const pausedControl = fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8');
+    const restartedSupervisor = new RunSupervisorService(workspace);
+    assert.equal(restartedSupervisor.getRunStatus(correlationId)?.status, 'paused');
+    restartedSupervisor.pause_run(correlationId);
+    assert.equal(fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8'), pausedControl);
+
+    restartedSupervisor.resume_run(correlationId);
+    await waitForFiles([resumeTargetPath]);
+    const resumePending = JSON.parse(fs.readFileSync(stateFilePath(workspace, runId), 'utf8')) as DetachedRunState;
+    assert.equal(resumePending.status, 'paused');
+    assert.equal(resumePending.lastControl, 'resume');
+    const pendingResumeControl = fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8');
+    restartedSupervisor.resume_run(correlationId);
+    assert.equal(fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8'), pendingResumeControl);
+    const running = await waitForRunState(workspace, runId, (entry) => entry.status === 'running');
+    assert.equal(running.lastControl, 'resume');
+    assert.equal(fs.readFileSync(resumeTargetPath, 'utf8'), 'root-pause-state');
+    const resumedControl = fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8');
+    restartedSupervisor.resume_run(correlationId);
+    assert.equal(fs.readFileSync(ctrlFilePath(workspace, runId), 'utf8'), resumedControl);
+
+    restartedSupervisor.cancel_run(correlationId);
+    assert.equal(fs.existsSync(cancelFilePath(workspace, runId)), true);
+    assert.throws(
+        () => restartedSupervisor.resume_run(correlationId),
+        (error: any) => error instanceof RunSupervisorError && error.code === 'RUN_CONTROL_INVALID_STATE'
+    );
+    assert.throws(
+        () => restartedSupervisor.pause_run(correlationId),
+        (error: any) => error instanceof RunSupervisorError && error.code === 'RUN_CONTROL_INVALID_STATE'
+    );
+    const result = await exitPromise;
+    assert.equal(result.code, 1, result.stderr);
+    const cancelled = await waitForRunState(workspace, runId, (entry) => entry.status === 'cancelled');
+    assert.equal(cancelled.lastControl, 'cancel');
+    assert.equal(cancelled.result?.status, 'cancelled');
+    assert.equal(fs.readFileSync(cancelTargetPath, 'utf8'), 'root-pause-state');
+
+    const terminalBytes = fs.readFileSync(stateFilePath(workspace, runId), 'utf8');
+    assert.throws(
+        () => restartedSupervisor.resume_run(correlationId),
+        (error: any) => error instanceof RunSupervisorError && error.code === 'RUN_CONTROL_INVALID_STATE'
+    );
+    assert.equal(fs.readFileSync(stateFilePath(workspace, runId), 'utf8'), terminalBytes);
+});
+
+test('durable cancellation wins after the last poll and cancel markers stay out of run listings', async (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const runId = 'run_cancel_final_window';
+    const correlationId = 'cancel-final-window';
+    const pipelinePath = fs.realpathSync.native(path.join(workspace, 'pipeline', 'demo.intent.json'));
+    const pipelineHash = createHash('sha256').update(fs.readFileSync(pipelinePath)).digest('hex');
+    const state: DetachedRunState = {
+        detachedRunId: runId,
+        correlationId,
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: 'demo',
+        pipelinePath,
+        pipelineHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, runId), state);
+    const readyPath = path.join(workspace, 'final-window-ready');
+    const releasePath = path.join(workspace, 'final-window-release');
+    const preloadPath = path.join(workspace, 'final-window-runtime.cjs');
+    const runtimeModule = path.resolve(__dirname, '..', 'coreRuntime.js');
+    const eventBusModule = path.resolve(__dirname, '..', 'eventBus.js');
+    fs.writeFileSync(preloadPath, [
+        `const fs = require('fs');`,
+        `const bus = require(${JSON.stringify(eventBusModule)}).pipelineEventBus;`,
+        `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
+        `  async run_pipeline_data() {`,
+        `    bus.emit({ type: 'pipelineStart', runId: 'root-final-window', timestamp: Date.now() });`,
+        `    fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
+        `    const deadline = Date.now() + 5000;`,
+        `    while (!fs.existsSync(${JSON.stringify(releasePath)}) && Date.now() < deadline) {`,
+        `      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`,
+        `    }`,
+        `    return { runId: 'root-final-window', success: true, status: 'success' };`,
+        `  }`,
+        `  pause() {} resume() {} cancel() {}`,
+        `};`
+    ].join('\n'), 'utf8');
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const child = cp.spawn(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', runId,
+        '--pipeline', 'demo',
+        '--pipeline_path', pipelinePath,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const exitPromise = waitForChildExit(child);
+    await waitForFiles([readyPath]);
+
+    const supervisor = new RunSupervisorService(workspace);
+    supervisor.cancel_run(correlationId);
+    assert.equal(supervisor.list_runs().length, 1);
+    assert.equal(supervisor.list_runs()[0].detachedRunId, runId);
+    // The worker is synchronously held after pipelineStart, so its timer has
+    // not acknowledged cancellation yet. The final transition must read the
+    // durable marker itself.
+    assert.equal(JSON.parse(fs.readFileSync(stateFilePath(workspace, runId), 'utf8')).status, 'running');
+    fs.writeFileSync(releasePath, 'release', 'utf8');
+    const result = await exitPromise;
+    assert.equal(result.code, 1, result.stderr);
+    const cancelled = JSON.parse(fs.readFileSync(stateFilePath(workspace, runId), 'utf8')) as DetachedRunState;
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(cancelled.result?.status, 'cancelled');
+    assert.equal(cancelled.result?.success, false);
+});
+
+test('cancelling a live terminal process is reported as cancelled', async (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const readyPath = path.join(workspace, 'long-terminal-ready');
+    const longCommand = process.platform === 'win32'
+        ? `Set-Content -LiteralPath '${readyPath.replace(/'/g, "''")}' -Value $PID; Start-Sleep -Seconds 30`
+        : `printf '%s' "$$" > '${readyPath.replace(/'/g, "'\\''")}'; sleep 30`;
+    fs.writeFileSync(
+        path.join(workspace, 'pipeline', 'long-terminal.intent.json'),
+        JSON.stringify({
+            name: 'long-terminal',
+            steps: [{
+                id: 'long-command',
+                intent: 'terminal.run',
+                capabilities: ['terminal.run'],
+                payload: { command: longCommand, cwd: '.' }
+            }]
+        }),
+        'utf8'
+    );
+    const supervisor = new RunSupervisorService(workspace);
+    const started = supervisor.start_detached({
+        pipeline: 'long-terminal',
+        correlationId: 'terminal-cancel-e2e'
+    });
+    t.after(() => {
+        if (!started.pid) return;
+        try { process.kill(started.pid); } catch { /* worker already exited */ }
+    });
+    await waitForFiles([readyPath], 15000);
+    const terminalPid = Number(fs.readFileSync(readyPath, 'utf8'));
+    assert.equal(Number.isSafeInteger(terminalPid) && terminalPid > 0, true);
+    supervisor.cancel_run('terminal-cancel-e2e');
+    const cancelled = await waitForRunState(
+        workspace,
+        started.detached_run_id,
+        (entry) => entry.status === 'cancelled',
+        60000
+    );
+    assert.equal(cancelled.result?.status, 'cancelled');
+    assert.equal(cancelled.result?.success, false);
+    assert.equal(cancelled.errorCode, undefined);
+    await waitForProcessExit(terminalPid, 10000);
+    if (started.pid) await waitForProcessExit(started.pid, 10000);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+});
+
+test('a natural terminal failure remains a pipeline failure', async (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    fs.writeFileSync(
+        path.join(workspace, 'pipeline', 'failed-terminal.intent.json'),
+        JSON.stringify({
+            name: 'failed-terminal',
+            steps: [{
+                id: 'failed-command',
+                intent: 'terminal.run',
+                capabilities: ['terminal.run'],
+                payload: { command: 'node definitely-missing-leion-script.cjs', cwd: '.' }
+            }]
+        }),
+        'utf8'
+    );
+    const supervisor = new RunSupervisorService(workspace);
+    const failed = supervisor.start_detached({
+        pipeline: 'failed-terminal',
+        correlationId: 'terminal-failure-e2e'
+    });
+    const failure = await waitForRunState(
+        workspace,
+        failed.detached_run_id,
+        (entry) => entry.status === 'failure',
+        15000
+    );
+    assert.equal(failure.status, 'failure');
+    assert.notEqual(failure.cancelRequested, true);
+    if (failed.pid) await waitForProcessExit(failed.pid, 10000);
+    await new Promise((resolve) => setTimeout(resolve, 250));
 });
 
 test('worker keeps root run state nonterminal across nested pipeline events', (t) => {

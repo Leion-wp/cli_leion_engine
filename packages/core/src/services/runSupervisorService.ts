@@ -42,6 +42,7 @@ export type DetachedRunState = {
     checkpointEveryNodes?: number;
     cancelRequested?: boolean;
     lastControl?: 'pause' | 'resume' | 'cancel';
+    lastControlRequestId?: string;
     error?: string;
     errorCode?: string;
     orphanedStatus?: RunStatus;
@@ -225,6 +226,10 @@ export function ctrlFilePath(workspaceRoot: string, detachedRunId: string): stri
     return path.join(getRunsDir(workspaceRoot), `${validateRunId(detachedRunId)}.ctrl.json`);
 }
 
+export function cancelFilePath(workspaceRoot: string, detachedRunId: string): string {
+    return path.join(getRunsDir(workspaceRoot), `${validateRunId(detachedRunId)}.cancel.json`);
+}
+
 export function eventsFilePath(workspaceRoot: string, detachedRunId: string): string {
     return path.join(getRunsDir(workspaceRoot), `${validateRunId(detachedRunId)}.events.ndjson`);
 }
@@ -263,6 +268,20 @@ export function correlationClaimFilePath(workspaceRoot: string, correlationId: s
     return path.join(correlationsDir(workspaceRoot), `${digest}.claim.json`);
 }
 
+function replaceJsonAtomically(temporaryPath: string, filePath: string): void {
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            fs.renameSync(temporaryPath, filePath);
+            return;
+        } catch (error: any) {
+            const transientWindowsLock = process.platform === 'win32' &&
+                ['EACCES', 'EBUSY', 'EPERM'].includes(String(error?.code || ''));
+            if (!transientWindowsLock || attempt >= 99) throw error;
+            sleepSync(10);
+        }
+    }
+}
+
 export function writeJsonFile(filePath: string, value: any): void {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const temporaryPath = path.join(
@@ -276,7 +295,7 @@ export function writeJsonFile(filePath: string, value: any): void {
         fs.fsyncSync(descriptor);
         fs.closeSync(descriptor);
         descriptor = undefined;
-        fs.renameSync(temporaryPath, filePath);
+        replaceJsonAtomically(temporaryPath, filePath);
         fsyncParentDirectory(filePath);
     } finally {
         if (descriptor !== undefined) {
@@ -812,26 +831,63 @@ export class RunSupervisorService {
                 `Cannot ${action} a terminal detached run.`
             );
         }
+        const response = () => ({
+            run_id: requestedRunId,
+            detached_run_id: detachedRunId,
+            ...(state.correlationId ? { correlation_id: state.correlationId } : {}),
+            action
+        });
+        const cancellationPath = cancelFilePath(this.workspaceRoot, detachedRunId);
+        const cancellationIsDurable = fs.existsSync(cancellationPath)
+            || persistedState.cancelRequested === true
+            || persistedState.status === 'cancel_requested';
+        if (cancellationIsDurable) {
+            if (action === 'cancel') return response();
+            throw new RunSupervisorError(
+                'RUN_CONTROL_INVALID_STATE',
+                `Cannot ${action} a detached run after cancellation was requested.`
+            );
+        }
+        const pendingControl = safeReadJson(ctrlFilePath(this.workspaceRoot, detachedRunId));
+        if (action === 'pause' && (persistedState.status === 'pause_requested' || persistedState.status === 'paused')) {
+            return response();
+        }
+        if (action === 'resume') {
+            if (String(pendingControl?.action || '').trim() === 'resume') return response();
+            if (
+                (persistedState.status === 'starting' || persistedState.status === 'running')
+                && String(pendingControl?.action || '').trim() !== 'pause'
+            ) {
+                return response();
+            }
+        }
         const updatedAt = this.now();
         const controlPath = ctrlFilePath(this.workspaceRoot, detachedRunId);
         const requestId = randomBytes(12).toString('hex');
-        writeJsonFile(controlPath, { action, requestedRunId, requestId, updatedAt });
+        const control = { action, requestedRunId, requestId, updatedAt };
+        if (action === 'cancel') {
+            // Cancellation has its own write-once marker. A concurrent pause or
+            // resume may replace the latest-control file, but it cannot erase
+            // this marker, so cancellation always wins when the worker polls.
+            writeExclusiveJson(cancellationPath, control);
+        }
+        writeJsonFile(controlPath, control);
         const latest = safeReadJson(statePath) as DetachedRunState | undefined;
         if (latest && TERMINAL_STATUSES.has(latest.status)) {
             try { fs.unlinkSync(controlPath); } catch (error: any) {
                 if (error?.code !== 'ENOENT') throw error;
+            }
+            if (action === 'cancel') {
+                try { fs.unlinkSync(cancellationPath); } catch (error: any) {
+                    if (error?.code !== 'ENOENT') throw error;
+                }
             }
             throw new RunSupervisorError(
                 'RUN_CONTROL_INVALID_STATE',
                 `Cannot ${action} a terminal detached run.`
             );
         }
-        return {
-            run_id: requestedRunId,
-            detached_run_id: detachedRunId,
-            ...(state.correlationId ? { correlation_id: state.correlationId } : {}),
-            action
-        };
+        return response();
     }
 
     pause_run(runId: string) { return this.writeControl(runId, 'pause'); }

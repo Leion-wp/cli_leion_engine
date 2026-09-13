@@ -1360,12 +1360,12 @@ async function runPipeline(
             let finalAttempt = 1;
             for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
                 finalAttempt = attempt;
+                let timeoutHandle: NodeJS.Timeout | undefined;
                 try {
                     const timedResult = await Promise.race([
                         routeIntent(compiledStep, variableCache),
                         new Promise<any>((_, reject) => {
-                            const handle = setTimeout(() => {
-                                clearTimeout(handle);
+                            timeoutHandle = setTimeout(() => {
                                 reject(new Error(`Step timed out after ${sandboxPolicy.timeoutMs}ms.`));
                             }, sandboxPolicy.timeoutMs);
                         })
@@ -1376,6 +1376,17 @@ async function runPipeline(
                     lastErrorMessage = `Step returned unsuccessful result for intent "${String(compiledStep.intent || '')}".`;
                 } catch (error: any) {
                     if (isInteractionRequired(error)) throw error;
+                    // A provider may reject because cancellation terminated its
+                    // in-flight work (for example a terminal child exits after
+                    // SIGTERM/taskkill). The explicit runner cancellation flag
+                    // is authoritative, so do not turn that acknowledgement
+                    // into a step failure or retry it.
+                    if (isCancelled) {
+                        result = false;
+                        ok = false;
+                        lastErrorMessage = '';
+                        break;
+                    }
                     lastErrorMessage = String(error?.message || error || 'Unknown error');
                     pipelineEventBus.emit({
                         type: 'stepLog',
@@ -1387,6 +1398,8 @@ async function runPipeline(
                     } as any);
                     result = false;
                     ok = false;
+                } finally {
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
                 }
 
                 if (attempt < retryPolicy.maxAttempts) {
@@ -1430,7 +1443,12 @@ async function runPipeline(
             }
 
             pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, timestamp: Date.now(), success: ok, index: currentIndex, stepId: compiledStep.id });
-             
+
+            if (isCancelled) {
+                runStatus = 'cancelled';
+                break;
+            }
+
             if (ok) {
                 currentIndex++;
             } else {
@@ -1446,7 +1464,7 @@ async function runPipeline(
                 break;
             }
         }
-        if (isCancelled && runStatus !== 'failure') {
+        if (isCancelled) {
             runStatus = 'cancelled';
         }
         pipelineEventBus.emit({

@@ -191,7 +191,20 @@ Control responses contain the requested `run_id`, resolved `detached_run_id`,
 optional `correlation_id`, and `action`. `stop_pipeline` returns action `pause`;
 `resume_pipeline` returns `resume`; `cancel_pipeline` returns `cancel`. Each
 persisted control request has a unique internal request ID, so commands created
-in the same millisecond remain distinct.
+in the same millisecond remain distinct. A pause first becomes
+`pause_requested`; the worker publishes `paused` only after `CoreRuntime`
+acknowledges a safe point between nodes. Resume keeps the durable state
+`paused` until `pipelineResume` acknowledges that execution has woken, then
+publishes `running`. Repeating an already pending or applied pause/resume is
+idempotent, including through a new supervisor process.
+
+Cancellation uses a separate write-once marker, so it wins races with later
+pause/resume writes and is checked again at the worker's terminal transition.
+Once cancellation is durable, pause and resume return
+`RUN_CONTROL_INVALID_STATE`; terminal state never regresses. In-flight terminal
+processes are stopped as a process tree and their cancellation exit is reported
+as `cancelled`. A command that exits unsuccessfully without a cancellation
+request remains a pipeline `failure`.
 
 Correlation, spawn and execution claims are published atomically under
 `.intent-router/runs`; correlation filenames use SHA-256 rather than caller
