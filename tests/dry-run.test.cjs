@@ -7,6 +7,7 @@ const runner = require('../packages/core/out/pipelineRunner');
 const router = require('../packages/core/out/router');
 const memory = require('../packages/core/out/runMemoryStore');
 const system = require('../packages/core/out/providers/systemAdapter');
+const { pipelineEventBus } = require('../packages/core/out/eventBus');
 
 test('dry-run prevents all provider, payload mapper, input and memory calls', async (t) => {
   const f = fixture(t);
@@ -175,4 +176,52 @@ test('dryRunChild suppresses providers in real local sub-pipeline and child-loop
   }
   assert.deepEqual(f.invocations, []);
   assert.equal(fs.existsSync(path.join(f.root, '.intent-router', 'run-memory-v2.json')), false);
+});
+
+test('nested pipeline completion restores root control context', async (t) => {
+  const f = fixture(t);
+  shim.setConfigEntries({ 'intentRouter.runtime.sandbox.timeoutMs': 1000 });
+  t.mock.restoreAll();
+  registry.resetRegistry();
+  const subscriptions = [];
+  system.registerSystemProvider({ subscriptions });
+  t.after(() => subscriptions.forEach((entry) => entry.dispose()));
+  const invoke = shim.commands.executeCommand;
+  t.mock.method(shim.commands, 'executeCommand', async (id, ...args) => invoke(id, ...args));
+  fs.writeFileSync(path.join(f.root, 'child.intent.json'), JSON.stringify({
+    name: 'child',
+    steps: [step('child-set', 'system.setVar', { name: 'child', value: 'done' })]
+  }));
+
+  let rootRunId;
+  let childRunId;
+  let pausedRunId;
+  let requestedControl = false;
+  const controlSubscription = pipelineEventBus.on((event) => {
+    if (event.type === 'pipelineStart') {
+      if (!rootRunId) rootRunId = event.runId;
+      else if (event.runId !== rootRunId) childRunId = event.runId;
+    }
+    if (event.type === 'stepEnd' && event.runId === rootRunId && event.stepId === 'child' && !requestedControl) {
+      requestedControl = true;
+      runner.pauseCurrentPipeline();
+      runner.resumeCurrentPipeline();
+    }
+    if (event.type === 'pipelinePause') pausedRunId = event.runId;
+  });
+  t.after(() => controlSubscription.dispose());
+
+  const result = await runner.runPipelineFromData({
+    name: 'parent',
+    steps: [
+      step('child', 'system.subPipeline', { pipelinePath: 'child.intent.json' }),
+      step('parent-set', 'system.setVar', { name: 'parent', value: 'done' })
+    ]
+  }, false);
+
+  assert.equal(result.status, 'success', JSON.stringify(f.events));
+  assert.ok(rootRunId);
+  assert.ok(childRunId);
+  assert.notEqual(childRunId, rootRunId);
+  assert.equal(pausedRunId, rootRunId);
 });

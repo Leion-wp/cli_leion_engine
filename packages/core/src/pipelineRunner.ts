@@ -617,6 +617,9 @@ async function runPipeline(
     context?: PipelineRunContext
 ): Promise<PipelineRunResult> {
     dryRun = dryRun || pipeline.meta?.dryRun === true;
+    const parentRunId = currentRunId;
+    const parentCancelled = isCancelled;
+    const parentPaused = isPaused;
     isCancelled = false;
     isPaused = false;
     let runStatus: 'success' | 'failure' | 'cancelled' = 'success';
@@ -1462,7 +1465,15 @@ async function runPipeline(
         if (isInteractionRequired(e)) throw e;
         return { runId, success: false, status: 'failure' };
     } finally {
-        currentRunId = null;
+        if (parentRunId) {
+            currentRunId = parentRunId;
+            isCancelled = parentCancelled || isCancelled;
+            isPaused = parentPaused || isPaused;
+        } else {
+            currentRunId = null;
+            isCancelled = false;
+            isPaused = false;
+        }
     }
 }
 
