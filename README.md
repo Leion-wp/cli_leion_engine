@@ -89,6 +89,18 @@ Describe and catalog return the same versioned envelope:
     "version": "0.1.0",
     "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "run_status", "run_list", "run_logs", "history_list", "history_show", "stop_pipeline", "resume_pipeline", "cancel_pipeline"],
     "contracts": {
+      "run_controls": {
+        "version": "1",
+        "idempotent": true,
+        "pauseRequestedState": "pause_requested",
+        "pauseAcknowledgedState": "paused",
+        "resumePendingState": "paused",
+        "resumeAcknowledgedState": "running",
+        "cancelRequestedState": "cancel_requested",
+        "cancelTerminalState": "cancelled",
+        "cancellationDominant": true,
+        "terminalProcessExitRequired": true
+      },
       "run_logs": {
         "version": "1",
         "cursorFormat": "lr1",
@@ -116,6 +128,10 @@ Describe and catalog return the same versioned envelope:
 the command subset of this protocol; it is distinct from the top-level array
 of intent descriptors. The real response fills that array from shared builtin
 provider declarations, plus the runner/router-owned `pipeline.run` container.
+`runtime.contracts.run_controls` is the machine-readable acknowledgement and
+cancellation contract consumed by control planes; command names alone do not
+prove those semantics. `runtime.contracts.run_logs` describes the durable event
+page that can be ingested without legacy log fallbacks.
 It neither constructs a runtime nor loads workspace configuration, custom
 nodes, credential material, history, or mutable provider registrations. It
 checks only whether `JULES_API_KEY` is present and structurally valid so the
