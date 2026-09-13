@@ -80,6 +80,18 @@ test('catalog preserves shared registration descriptors and exposes conservative
   assert.deepEqual(envelope.runtime.capabilities, PROTOCOL_COMMANDS);
   assert.equal(envelope.runtime.contracts.run_logs.cursorFormat, 'lr1');
   assert.equal(envelope.runtime.contracts.run_logs.eventVersion, 1);
+  assert.deepEqual(envelope.runtime.contracts.run_controls, {
+    version: '1',
+    idempotent: true,
+    pauseRequestedState: 'pause_requested',
+    pauseAcknowledgedState: 'paused',
+    resumePendingState: 'paused',
+    resumeAcknowledgedState: 'running',
+    cancelRequestedState: 'cancel_requested',
+    cancelTerminalState: 'cancelled',
+    cancellationDominant: true,
+    terminalProcessExitRequired: true
+  });
   assert.deepEqual(envelope.runtime.contracts.run_logs.limits, {
     default: 100,
     max: 200,

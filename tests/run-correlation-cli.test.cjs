@@ -42,6 +42,18 @@ test('runtime descriptor advertises correlation status, list, logs and controls'
   }
   const pipelineRun = stdout.capabilities.find((entry) => entry.capability === 'pipeline.run');
   assert.ok(pipelineRun.args.some((entry) => entry.name === 'correlation_id'));
+  assert.deepEqual(stdout.runtime.contracts.run_controls, {
+    version: '1',
+    idempotent: true,
+    pauseRequestedState: 'pause_requested',
+    pauseAcknowledgedState: 'paused',
+    resumePendingState: 'paused',
+    resumeAcknowledgedState: 'running',
+    cancelRequestedState: 'cancel_requested',
+    cancelTerminalState: 'cancelled',
+    cancellationDominant: true,
+    terminalProcessExitRequired: true
+  });
   assert.deepEqual(stdout.runtime.contracts.run_logs, {
     version: '1',
     cursorFormat: 'lr1',

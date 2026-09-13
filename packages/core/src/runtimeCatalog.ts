@@ -2,6 +2,7 @@ import { builtinCapabilityRegistrations, julesCapabilities } from './builtinCapa
 import { policyCapabilities } from './policyCapability';
 import { CapabilityArgument } from './types';
 import { RUN_LOG_CONTRACT } from './runLogContract';
+import { RUN_CONTROL_CONTRACT } from './runControlContract';
 import { isJulesConfigured } from './providers/julesAdapter';
 
 export const PROTOCOL_VERSION = '1';
@@ -146,7 +147,10 @@ export function describeRuntime(version: string) {
             name: 'leion-roots',
             version,
             capabilities: [...PROTOCOL_COMMANDS],
-            contracts: { run_logs: RUN_LOG_CONTRACT }
+            contracts: {
+                run_controls: RUN_CONTROL_CONTRACT,
+                run_logs: RUN_LOG_CONTRACT
+            }
         },
         capabilities: getRuntimeCapabilities()
     };
