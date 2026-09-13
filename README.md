@@ -87,7 +87,26 @@ Describe and catalog return the same versioned envelope:
   "runtime": {
     "name": "leion-roots",
     "version": "0.1.0",
-    "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "run_status", "run_list", "run_logs", "history_list", "history_show", "stop_pipeline", "resume_pipeline", "cancel_pipeline"]
+    "capabilities": ["catalog", "validate_pipeline", "run_pipeline", "route_intent", "run_status", "run_list", "run_logs", "history_list", "history_show", "stop_pipeline", "resume_pipeline", "cancel_pipeline"],
+    "contracts": {
+      "run_logs": {
+        "version": "1",
+        "cursorFormat": "lr1",
+        "cursorMonotone": true,
+        "legacyIntegerCursor": true,
+        "eventVersion": 1,
+        "stableEventIds": true,
+        "corruptionPolicy": "projected_event",
+        "canonicalFields": ["run_id", "detached_run_id", "correlation_id", "events", "next_cursor", "has_more"],
+        "limits": {
+          "default": 100,
+          "max": 200,
+          "maxRecordBytes": 16384,
+          "maxResponseBytes": 524288,
+          "maxScanBytes": 8388608
+        }
+      }
+    }
   },
   "capabilities": []
 }
@@ -185,11 +204,92 @@ The public correlation/run contract uses these diagnostic codes:
 `RUN_CORRELATION_REQUIRES_DETACHED`, `RUN_CORRELATION_INVALID`,
 `RUN_CORRELATION_CONFLICT`, `RUN_CORRELATION_CLAIM_INVALID`,
 `RUN_ID_REQUIRED`, `RUN_ID_INVALID`, `RUN_ID_EXHAUSTED`, `RUN_NOT_FOUND`,
-`RUN_CURSOR_INVALID`, `RUN_STATE_INVALID`, `RUN_STATE_PERSIST_FAILED`,
+`RUN_CURSOR_INVALID`, `RUN_LIMIT_INVALID`, `RUN_LOG_SCAN_LIMIT`,
+`RUN_STATE_INVALID`, `RUN_STATE_PERSIST_FAILED`,
 `RUN_WORKER_SPAWN_FAILED`, `RUN_WORKER_NOT_RUNNING`,
 `RUN_CONTROL_INVALID_STATE`, `RUN_PIPELINE_CHANGED`, `RUN_PIPELINE_INVALID`,
 `RUN_SPAWN_CLAIM_TIMEOUT`, `RUN_STORAGE_UNSAFE`, `PIPELINE_REQUIRED`,
 `PIPELINE_NOT_FOUND`, and `WORKSPACE_NOT_FOUND`.
+
+## Run log pagination
+
+The control-plane command is:
+
+```sh
+node packages/cli/out/index.js run_logs \
+  --workspace /absolute/workspace \
+  --run_id delivery:42 \
+  --cursor lr1.1.178.51d036c304e84c2b \
+  --limit 100 \
+  --json
+```
+
+`--run_id` accepts a correlation ID, detached run ID or runtime run ID. `--limit`
+defaults to 100 and accepts integers from 1 through 200. Omit `--cursor` for the
+first page. Consumers must treat the canonical `lr1` cursor as opaque. A
+non-negative integer is accepted as a compatibility cursor and means a
+zero-based persisted record position.
+
+The canonical response uses snake_case:
+
+```json
+{
+  "run_id": "delivery:42",
+  "detached_run_id": "run_demo_123",
+  "correlation_id": "delivery:42",
+  "events": [
+    {
+      "event_id": "evt_965611dd23e2249f958cbd5560f2b343994a34071d87662f666dfbd2156a35fd",
+      "type": "run.detached_started",
+      "occurred_at": "2026-09-13T11:46:40.000Z",
+      "event_version": 1,
+      "sequence": 0,
+      "run_id": "run_demo_123",
+      "detached_run_id": "run_demo_123",
+      "correlation_id": "delivery:42",
+      "payload": {
+        "detachedRunId": "run_demo_123",
+        "correlationId": "delivery:42",
+        "dryRun": true
+      },
+      "eventVersion": 1,
+      "ts": 1789300000000,
+      "runId": "run_demo_123"
+    }
+  ],
+  "next_cursor": "lr1.1.178.51d036c304e84c2b",
+  "has_more": false,
+  "nextCursor": 1,
+  "hasMore": false
+}
+```
+
+`next_cursor` is always a non-empty string, including on an empty final page.
+It advances only after a returned persisted record. Repeating a request with
+the same cursor against an unchanged journal returns the same event IDs and
+records. `sequence` is a zero-based integer. `event_id` is a SHA-256 identity
+derived only from the detached run identity and the record's byte position.
+`payload` is always an object projected through a metadata allowlist; raw
+pipeline payloads, arguments, outputs, log text and error messages are never
+returned. The legacy `eventVersion`, `ts`, `runId`, `nextCursor` and `hasMore`
+fields remain additive compatibility aliases.
+
+For pipeline events, `event.run_id` can be the runtime pipeline run ID and can
+differ from `event.detached_run_id`; the latter remains the stable supervisor
+identity. The worker journals `pipelineEnd`, then `run.worker_finished` or
+`run.worker_error`, before publishing a terminal detached-run state.
+
+Malformed JSON records are returned as stable `run.record_corrupt` events with
+`{ "code": "RUN_LOG_RECORD_CORRUPT" }`. Records over 16 KiB are returned as
+stable `run.record_oversize` events with
+`{ "code": "RUN_LOG_RECORD_OVERSIZE" }`; their content is not decoded or
+returned, and each advances exactly one sequence. A final record fragment with
+no newline remains pending: the cursor does not advance and `has_more` remains
+false until a later poll sees the completed record. A record crossing the 8 MiB
+scan bound returns `RUN_LOG_SCAN_LIMIT` instead of skipping bytes. Invalid
+cursors return `RUN_CURSOR_INVALID`; invalid limits return `RUN_LIMIT_INVALID`.
+The complete pretty-printed CLI JSON response, including its final newline, is
+bounded to 512 KiB.
 
 ## Static pipeline validation
 

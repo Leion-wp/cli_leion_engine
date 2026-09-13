@@ -2,6 +2,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
 import { createHash, randomBytes } from 'crypto';
+import {
+    RUN_LOG_CURSOR_FORMAT,
+    RUN_LOG_DEFAULT_LIMIT,
+    RUN_LOG_EVENT_VERSION,
+    RUN_LOG_MAX_LIMIT,
+    RUN_LOG_MAX_RECORD_BYTES,
+    RUN_LOG_MAX_RESPONSE_BYTES,
+    RUN_LOG_MAX_SCAN_BYTES
+} from '../runLogContract';
 
 export type RunStatus =
     | 'starting'
@@ -47,6 +56,29 @@ export type RunEventRecord = {
     runId: string;
     type: string;
     payload: any;
+};
+
+export type RunLogEvent = RunEventRecord & {
+    event_id: string;
+    occurred_at: string | null;
+    event_version: 1;
+    sequence: number;
+    run_id: string;
+    detached_run_id: string;
+    correlation_id?: string;
+    step_id?: string;
+    source_node_id?: string;
+};
+
+export type RunLogPage = {
+    run_id: string;
+    detached_run_id: string;
+    correlation_id?: string;
+    events: RunLogEvent[];
+    next_cursor: string;
+    has_more: boolean;
+    nextCursor: number;
+    hasMore: boolean;
 };
 
 export type StartDetachedOptions = {
@@ -349,6 +381,199 @@ export function sanitizeWorkerError(error: any): { code: string; message: string
                 ? 'Pipeline content is not valid JSON.'
                 : 'Detached worker failed.';
     return { code, message };
+}
+
+type RunLogCursorPosition = {
+    sequence: number;
+    byteOffset?: number;
+    legacy: boolean;
+};
+
+const LOG_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const LOG_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function cursorChecksum(detachedRunId: string, sequence: number, byteOffset: number): string {
+    return createHash('sha256')
+        .update(`${detachedRunId}\0${sequence}\0${byteOffset}`, 'utf8')
+        .digest('hex')
+        .slice(0, 16);
+}
+
+function encodeRunLogCursor(detachedRunId: string, sequence: number, byteOffset: number): string {
+    return `${RUN_LOG_CURSOR_FORMAT}.${sequence}.${byteOffset}.${cursorChecksum(detachedRunId, sequence, byteOffset)}`;
+}
+
+function parseRunLogCursor(detachedRunId: string, cursor?: string | number): RunLogCursorPosition {
+    if (cursor === undefined || cursor === null || cursor === '') {
+        return { sequence: 0, byteOffset: 0, legacy: false };
+    }
+    const raw = String(cursor).trim();
+    if (/^[0-9]+$/.test(raw)) {
+        const sequence = Number(raw);
+        if (Number.isSafeInteger(sequence)) return { sequence, legacy: true };
+    }
+    const match = new RegExp(`^${RUN_LOG_CURSOR_FORMAT}\\.([0-9]+)\\.([0-9]+)\\.([a-f0-9]{16})$`).exec(raw);
+    if (match) {
+        const sequence = Number(match[1]);
+        const byteOffset = Number(match[2]);
+        if (
+            Number.isSafeInteger(sequence)
+            && Number.isSafeInteger(byteOffset)
+            && match[3] === cursorChecksum(detachedRunId, sequence, byteOffset)
+        ) {
+            return { sequence, byteOffset, legacy: false };
+        }
+    }
+    throw new RunSupervisorError('RUN_CURSOR_INVALID', 'run_logs cursor is invalid for this run.');
+}
+
+function normalizeRunLogLimit(limit?: number): number {
+    if (limit === undefined) return RUN_LOG_DEFAULT_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > RUN_LOG_MAX_LIMIT) {
+        throw new RunSupervisorError(
+            'RUN_LIMIT_INVALID',
+            `run_logs limit must be an integer between 1 and ${RUN_LOG_MAX_LIMIT}.`
+        );
+    }
+    return limit;
+}
+
+function locateLegacyCursorOffset(
+    descriptor: number,
+    snapshotSize: number,
+    targetSequence: number
+): number {
+    if (targetSequence === 0) return 0;
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    let sequence = 0;
+    while (position < snapshotSize && position < RUN_LOG_MAX_SCAN_BYTES) {
+        const length = Math.min(chunk.length, snapshotSize - position, RUN_LOG_MAX_SCAN_BYTES - position);
+        const bytesRead = fs.readSync(descriptor, chunk, 0, length, position);
+        if (bytesRead <= 0) break;
+        for (let index = 0; index < bytesRead; index += 1) {
+            if (chunk[index] !== 0x0a) continue;
+            sequence += 1;
+            if (sequence === targetSequence) return position + index + 1;
+        }
+        position += bytesRead;
+    }
+    if (position >= RUN_LOG_MAX_SCAN_BYTES && position < snapshotSize) {
+        throw new RunSupervisorError('RUN_LOG_SCAN_LIMIT', 'Legacy run_logs cursor exceeds the bounded scan window.');
+    }
+    throw new RunSupervisorError('RUN_CURSOR_INVALID', 'run_logs cursor is beyond the persisted event stream.');
+}
+
+function safeLogPayload(eventType: string, value: any): Record<string, any> {
+    const projected = projectRunEventPayload(eventType, value);
+    const safe: Record<string, any> = {};
+    const idFields = new Set(['runId', 'intentId', 'nodeId', 'stepId', 'detachedRunId', 'correlationId']);
+    const numberFields = new Set([
+        'index', 'timestamp', 'totalSteps', 'completedSteps', 'checkpointEveryNodes', 'textLength'
+    ]);
+    const booleanFields = new Set(['success', 'dryRun']);
+    const enumFields: Record<string, Set<string>> = {
+        stream: new Set(['stdout', 'stderr']),
+        action: new Set(['pause', 'resume', 'cancel']),
+        status: new Set(['starting', 'running', 'pause_requested', 'paused', 'cancel_requested', 'success', 'failure', 'cancelled', 'detached'])
+    };
+    for (const [key, entry] of Object.entries(projected)) {
+        if (numberFields.has(key)) {
+            if (typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0) safe[key] = entry;
+            continue;
+        }
+        if (booleanFields.has(key)) {
+            if (typeof entry === 'boolean') safe[key] = entry;
+            continue;
+        }
+        if (typeof entry !== 'string') continue;
+        if (idFields.has(key)) {
+            if (LOG_ID_PATTERN.test(entry)) safe[key] = entry;
+            continue;
+        }
+        if (enumFields[key]) {
+            if (enumFields[key].has(entry)) safe[key] = entry;
+            continue;
+        }
+        if (key === 'code') {
+            if (LOG_CODE_PATTERN.test(entry)) safe[key] = entry;
+            continue;
+        }
+        if (key === 'textSha256' && /^[a-f0-9]{64}$/.test(entry)) safe[key] = entry;
+    }
+    return safe;
+}
+
+function stableRunLogEventId(detachedRunId: string, byteOffset: number): string {
+    return `evt_${createHash('sha256').update(`${detachedRunId}\0${byteOffset}`, 'utf8').digest('hex')}`;
+}
+
+function projectPersistedRunLogEvent(
+    detachedRunId: string,
+    correlationId: string | undefined,
+    sequence: number,
+    byteOffset: number,
+    line: Buffer
+): RunLogEvent {
+    const eventId = stableRunLogEventId(detachedRunId, byteOffset);
+    const corrupt = (type: 'run.record_corrupt' | 'run.record_oversize', code: string): RunLogEvent => ({
+        eventVersion: RUN_LOG_EVENT_VERSION,
+        ts: 0,
+        runId: detachedRunId,
+        type,
+        payload: { code },
+        event_id: eventId,
+        occurred_at: null,
+        event_version: RUN_LOG_EVENT_VERSION,
+        sequence,
+        run_id: detachedRunId,
+        detached_run_id: detachedRunId,
+        ...(correlationId ? { correlation_id: correlationId } : {})
+    });
+    if (line.byteLength > RUN_LOG_MAX_RECORD_BYTES) {
+        return corrupt('run.record_oversize', 'RUN_LOG_RECORD_OVERSIZE');
+    }
+    let parsed: any;
+    try {
+        const text = line.length > 0 && line[line.length - 1] === 0x0d
+            ? line.subarray(0, line.length - 1).toString('utf8')
+            : line.toString('utf8');
+        parsed = JSON.parse(text);
+    } catch {
+        return corrupt('run.record_corrupt', 'RUN_LOG_RECORD_CORRUPT');
+    }
+    const rawType = String(parsed?.type || '').trim();
+    if (
+        !parsed
+        || typeof parsed !== 'object'
+        || Array.isArray(parsed)
+        || parsed.eventVersion !== RUN_LOG_EVENT_VERSION
+        || !LOG_ID_PATTERN.test(rawType)
+    ) {
+        return corrupt('run.record_corrupt', 'RUN_LOG_RECORD_CORRUPT');
+    }
+    const timestamp = Number(parsed.ts);
+    const validTimestamp = Number.isFinite(timestamp) && timestamp >= 0 && timestamp <= 8_640_000_000_000_000;
+    const safeTimestamp = validTimestamp ? Math.floor(timestamp) : 0;
+    const payload = safeLogPayload(rawType, parsed.payload);
+    const persistedRunId = String(parsed.runId || '').trim();
+    const safeRunId = LOG_ID_PATTERN.test(persistedRunId) ? persistedRunId : detachedRunId;
+    return {
+        eventVersion: RUN_LOG_EVENT_VERSION,
+        ts: safeTimestamp,
+        runId: safeRunId,
+        type: rawType,
+        payload,
+        event_id: eventId,
+        occurred_at: validTimestamp ? new Date(safeTimestamp).toISOString() : null,
+        event_version: RUN_LOG_EVENT_VERSION,
+        sequence,
+        run_id: safeRunId,
+        detached_run_id: detachedRunId,
+        ...(correlationId ? { correlation_id: correlationId } : {}),
+        ...(typeof payload.stepId === 'string' ? { step_id: payload.stepId } : {}),
+        ...(typeof payload.nodeId === 'string' ? { source_node_id: payload.nodeId } : {})
+    };
 }
 
 function generateDetachedRunId(): string {
@@ -868,28 +1093,117 @@ export class RunSupervisorService {
         }
     }
 
-    tail_events(runId: string, cursor?: number): { events: RunEventRecord[]; nextCursor: number } {
+    tail_events(runId: string, cursor?: string | number, limit?: number): RunLogPage {
         const state = this.findRunState(runId);
         if (!state) throw new RunSupervisorError('RUN_NOT_FOUND', `Run not found for id: ${runId}`);
+        const pageLimit = normalizeRunLogLimit(limit);
+        const cursorPosition = parseRunLogCursor(state.detachedRunId, cursor);
         const filePath = eventsFilePath(this.workspaceRoot, state.detachedRunId);
-        if (!fs.existsSync(filePath)) return { events: [], nextCursor: 0 };
-        const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean);
-        const from = Math.max(0, Math.floor(Number(cursor || 0)));
-        const parsed: RunEventRecord[] = [];
-        for (let index = from; index < lines.length; index += 1) {
-            try {
-                const row = JSON.parse(lines[index]);
-                if (row && row.eventVersion === 1) parsed.push(row as RunEventRecord);
-            } catch { /* ignore malformed lines */ }
-        }
-        const config = safeReadJson(path.join(this.workspaceRoot, '.intent-router', 'config.json'));
-        const maxItems = normalizePositiveInt(
-            config?.intentRouter?.tui?.events?.maxItems ?? config?.['intentRouter.tui.events.maxItems'],
-            5000
+        const requestedRunId = String(runId || '').trim();
+        const buildPage = (
+            events: RunLogEvent[],
+            sequence: number,
+            byteOffset: number,
+            hasMore: boolean
+        ): RunLogPage => ({
+            run_id: requestedRunId,
+            detached_run_id: state.detachedRunId,
+            ...(state.correlationId ? { correlation_id: state.correlationId } : {}),
+            events,
+            next_cursor: encodeRunLogCursor(state.detachedRunId, sequence, byteOffset),
+            has_more: hasMore,
+            nextCursor: sequence,
+            hasMore
+        });
+        const emptyPage = (sequence: number, byteOffset: number): RunLogPage => (
+            buildPage([], sequence, byteOffset, false)
         );
-        return {
-            events: parsed.length > maxItems ? parsed.slice(parsed.length - maxItems) : parsed,
-            nextCursor: lines.length
-        };
+        if (!fs.existsSync(filePath)) {
+            if (cursorPosition.sequence !== 0 || Number(cursorPosition.byteOffset || 0) !== 0) {
+                throw new RunSupervisorError('RUN_CURSOR_INVALID', 'run_logs cursor is beyond the persisted event stream.');
+            }
+            return emptyPage(0, 0);
+        }
+        const descriptor = fs.openSync(filePath, 'r');
+        try {
+            const snapshotSize = fs.fstatSync(descriptor).size;
+            const startOffset = cursorPosition.legacy
+                ? locateLegacyCursorOffset(descriptor, snapshotSize, cursorPosition.sequence)
+                : Number(cursorPosition.byteOffset || 0);
+            if (startOffset < 0 || startOffset > snapshotSize) {
+                throw new RunSupervisorError('RUN_CURSOR_INVALID', 'run_logs cursor is beyond the persisted event stream.');
+            }
+            if (startOffset > 0) {
+                const boundary = Buffer.allocUnsafe(1);
+                const boundaryRead = fs.readSync(descriptor, boundary, 0, 1, startOffset - 1);
+                if (boundaryRead !== 1 || boundary[0] !== 0x0a) {
+                    throw new RunSupervisorError('RUN_CURSOR_INVALID', 'run_logs cursor does not point to a record boundary.');
+                }
+            }
+            if (startOffset === snapshotSize) return emptyPage(cursorPosition.sequence, startOffset);
+
+            const readLength = Math.min(snapshotSize - startOffset, RUN_LOG_MAX_SCAN_BYTES);
+            const buffer = Buffer.allocUnsafe(readLength);
+            let bytesRead = 0;
+            while (bytesRead < readLength) {
+                const count = fs.readSync(
+                    descriptor,
+                    buffer,
+                    bytesRead,
+                    readLength - bytesRead,
+                    startOffset + bytesRead
+                );
+                if (count <= 0) break;
+                bytesRead += count;
+            }
+            const snapshot = bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead);
+            const events: RunLogEvent[] = [];
+            let lineStart = 0;
+            let nextSequence = cursorPosition.sequence;
+            let nextOffset = startOffset;
+            let hasMore = false;
+
+            for (let index = 0; index < snapshot.length; index += 1) {
+                if (snapshot[index] !== 0x0a) continue;
+                if (events.length >= pageLimit) {
+                    hasMore = true;
+                    break;
+                }
+                const event = projectPersistedRunLogEvent(
+                    state.detachedRunId,
+                    state.correlationId,
+                    nextSequence,
+                    startOffset + lineStart,
+                    snapshot.subarray(lineStart, index)
+                );
+                const candidateSequence = nextSequence + 1;
+                const candidateOffset = startOffset + index + 1;
+                const candidatePage = buildPage(
+                    [...events, event],
+                    candidateSequence,
+                    candidateOffset,
+                    true
+                );
+                const candidateBytes = Buffer.byteLength(`${JSON.stringify(candidatePage, null, 2)}\n`, 'utf8');
+                if (events.length > 0 && candidateBytes > RUN_LOG_MAX_RESPONSE_BYTES) {
+                    hasMore = true;
+                    break;
+                }
+                events.push(event);
+                nextSequence = candidateSequence;
+                nextOffset = candidateOffset;
+                lineStart = index + 1;
+            }
+
+            if (!hasMore && nextOffset < snapshotSize && snapshotSize > startOffset + snapshot.length) {
+                if (lineStart < snapshot.length) {
+                    throw new RunSupervisorError('RUN_LOG_SCAN_LIMIT', 'A run log record exceeds the bounded scan window.');
+                }
+                hasMore = true;
+            }
+            return buildPage(events, nextSequence, nextOffset, hasMore);
+        } finally {
+            fs.closeSync(descriptor);
+        }
     }
 }

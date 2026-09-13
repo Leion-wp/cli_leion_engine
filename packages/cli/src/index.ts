@@ -437,13 +437,29 @@ async function handleRunList(workspaceRoot: string): Promise<void> {
 async function handleRunLogs(workspaceRoot: string, flags: Record<string, string | boolean>): Promise<void> {
     const requestedRunId = String(flags.run_id || '').trim();
     if (!requestedRunId) throw Object.assign(new Error('run_logs requires --run_id'), { code: 'RUN_ID_REQUIRED' });
-    const cursorRaw = String(flags.cursor || '').trim();
-    const cursor = cursorRaw ? Number(cursorRaw) : undefined;
-    if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
-        throw Object.assign(new Error('run_logs --cursor must be a non-negative integer.'), { code: 'RUN_CURSOR_INVALID' });
+    if (flags.cursor === true) {
+        throw Object.assign(new Error('run_logs --cursor requires a value.'), { code: 'RUN_CURSOR_INVALID' });
+    }
+    const cursor = typeof flags.cursor === 'string' ? flags.cursor.trim() : undefined;
+    if (cursor === '') {
+        throw Object.assign(new Error('run_logs --cursor requires a value.'), { code: 'RUN_CURSOR_INVALID' });
+    }
+    if (cursor !== undefined && !/^(?:[0-9]+|lr1\.[0-9]+\.[0-9]+\.[a-f0-9]{16})$/.test(cursor)) {
+        throw Object.assign(new Error('run_logs --cursor is not a supported cursor.'), { code: 'RUN_CURSOR_INVALID' });
+    }
+    if (flags.limit === true) {
+        throw Object.assign(new Error('run_logs --limit requires a value.'), { code: 'RUN_LIMIT_INVALID' });
+    }
+    const limitRaw = typeof flags.limit === 'string' ? flags.limit.trim() : undefined;
+    const limit = limitRaw === undefined ? undefined : Number(limitRaw);
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > core.RUN_LOG_MAX_LIMIT)) {
+        throw Object.assign(
+            new Error(`run_logs --limit must be an integer between 1 and ${core.RUN_LOG_MAX_LIMIT}.`),
+            { code: 'RUN_LIMIT_INVALID' }
+        );
     }
     const supervisor = new core.RunSupervisorService(workspaceRoot);
-    process.stdout.write(`${JSON.stringify(supervisor.tail_events(requestedRunId, cursor), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(supervisor.tail_events(requestedRunId, cursor, limit), null, 2)}\n`);
 }
 
 async function writeControlCommand(
@@ -541,7 +557,7 @@ function printHelp(): void {
         '  run_pipeline --pipeline <path|name> [--from <node_position>] [--dry_run] [--detached] [--correlation_id <id>] [--verbose]',
         '  run_status --run_id <detached|runtime|correlation> [--json]',
         '  run_list [--json]',
-        '  run_logs --run_id <detached|runtime|correlation> [--cursor <offset>] [--json]',
+        '  run_logs --run_id <detached|runtime|correlation> [--cursor <opaque|legacy-record>] [--limit <1-200>] [--json]',
         '  stop_pipeline --run_id <detached|runtime|correlation> [--verbose]',
         '  resume_pipeline --run_id <detached|runtime|correlation> [--verbose]',
         '  cancel_pipeline --run_id <detached|runtime|correlation> [--verbose]',

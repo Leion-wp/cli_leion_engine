@@ -101,6 +101,17 @@ function failBeforeRuntime(
     message: string
 ): never {
     const now = Date.now();
+    try {
+        appendEventRecord(eventsPath, {
+            eventVersion: 1,
+            ts: now,
+            runId: state.detachedRunId,
+            type: 'run.worker_error',
+            payload: { code }
+        });
+    } catch {
+        // Observability must not prevent publishing the terminal state.
+    }
     writeJsonFile(statePath, {
         ...state,
         status: 'failure',
@@ -108,13 +119,6 @@ function failBeforeRuntime(
         error: message,
         endedAt: now,
         updatedAt: now
-    });
-    appendEventRecord(eventsPath, {
-        eventVersion: 1,
-        ts: now,
-        runId: state.detachedRunId,
-        type: 'run.worker_error',
-        payload: { code }
     });
     throw Object.assign(new Error(message), { code });
 }
@@ -289,22 +293,9 @@ async function main(): Promise<void> {
             return;
         }
 
-        if (event?.type === 'pipelineEnd') {
-            const nextStatus: RunStatus = cancelRequested
-                ? 'cancelled'
-                : (event?.status === 'cancelled'
-                    ? 'cancelled'
-                    : (event?.success ? 'success' : 'failure'));
-            writeState({
-                status: nextStatus,
-                result: {
-                    runId: String(event?.runId || ''),
-                    success: event?.success === true,
-                    status: nextStatus
-                },
-                endedAt: Date.now()
-            });
-        }
+        // pipelineEnd remains journaled above. The worker publishes its final
+        // event before making the root state terminal after run_pipeline_data
+        // returns, so a terminal-state observer can drain a complete journal.
     });
 
     const processPendingControl = () => {
@@ -365,13 +356,13 @@ async function main(): Promise<void> {
 
     try {
         if (cancelRequested) {
+            appendEvent('run.worker_finished', { status: 'cancelled', success: false }, args.runId);
             writeState({
                 cancelRequested: true,
                 status: 'cancelled',
                 result: { success: false, status: 'cancelled' },
                 endedAt: Date.now()
             });
-            appendEvent('run.worker_finished', { status: 'cancelled', success: false }, args.runId);
             process.exitCode = 1;
             return;
         }
@@ -384,18 +375,19 @@ async function main(): Promise<void> {
             : (result?.status === 'cancelled'
                 ? 'cancelled'
                 : (result?.success ? 'success' : 'failure'));
+        appendEvent('run.worker_finished', {
+            status: nextStatus,
+            success: result?.success === true
+        }, String(result?.runId || state.pipelineRunId || args.runId));
         writeState({
             status: nextStatus,
             result: projectRunResult(result),
             endedAt: Date.now()
         });
-        appendEvent('run.worker_finished', {
-            status: nextStatus,
-            success: result?.success === true
-        }, String(result?.runId || state.pipelineRunId || args.runId));
         process.exitCode = nextStatus === 'success' ? 0 : 1;
     } catch (error: any) {
         const sanitizedError = sanitizeWorkerError(error);
+        appendEvent('run.worker_error', { code: sanitizedError.code }, state.pipelineRunId || args.runId);
         writeState({
             status: state.cancelRequested ? 'cancelled' : 'failure',
             errorCode: sanitizedError.code,
@@ -403,7 +395,6 @@ async function main(): Promise<void> {
             result: undefined,
             endedAt: Date.now()
         });
-        appendEvent('run.worker_error', { code: sanitizedError.code }, state.pipelineRunId || args.runId);
         process.exitCode = 1;
     } finally {
         clearInterval(timer);
