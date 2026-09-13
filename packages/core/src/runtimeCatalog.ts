@@ -26,6 +26,15 @@ export type CapabilityDescriptor = {
     available: boolean | 'unknown';
 };
 
+// Keep static introspection and registry-oriented consumers on one canonical
+// registration set. policyCapabilities lives separately to keep the evaluator
+// isolated, but is still a builtin runtime capability.
+if (!builtinCapabilityRegistrations.some((registration) =>
+    registration.capabilities.some((entry) => typeof entry !== 'string' && entry.capability === 'system.policy.check')
+)) {
+    builtinCapabilityRegistrations.push(policyCapabilities);
+}
+
 // Some legacy builder arguments are labelled "string", while their runtime
 // implementations explicitly consume arrays/objects. Preserve that original
 // metadata and publish the proven JSON input types used by static validation separately.
@@ -83,7 +92,7 @@ export function getRuntimeCapabilities(): CapabilityDescriptor[] {
         description: 'Pipeline container and inline composite intent supported by the runner/router',
         host: 'cli', executionMode: 'composite', risk: 'unknown', requirements: [], available: true
     }];
-    for (const registration of [...builtinCapabilityRegistrations, policyCapabilities]) {
+    for (const registration of builtinCapabilityRegistrations) {
         for (const entry of registration.capabilities) {
             if (typeof entry === 'string') continue;
             descriptors.push({
