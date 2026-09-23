@@ -668,7 +668,18 @@ async function runPipeline(
                 }
             };
             const stepId = String(step?.id || '').trim();
-            if (stepId && blockedStepIds.has(stepId)) { currentIndex++; continue; }
+            if (stepId && blockedStepIds.has(stepId)) {
+                pipelineEventBus.emitStepLifecycle({
+                    runId,
+                    stepId: step.id,
+                    index: currentIndex,
+                    attempt: 1,
+                    state: 'skipped',
+                    timestamp: Date.now()
+                });
+                currentIndex++;
+                continue;
+            }
             const localIntentId = generateSecureToken(8);
 
             // These runner-owned operations bypass routeIntent. In preview they
@@ -676,7 +687,7 @@ async function runPipeline(
             if (step.meta?.dryRun && ['system.form', 'memory.save', 'memory.recall', 'memory.clear'].includes(step.intent)) {
                 pipelineEventBus.emit({ type: 'stepStart', runId, intentId: localIntentId, timestamp: Date.now(), description: step.description, intent: step.intent, index: currentIndex, stepId: step.id });
                 pipelineEventBus.emit({ type: 'stepLog', runId, intentId: localIntentId, stepId: step.id, text: `[dry-run] Skipped ${step.intent}; no input or memory operation performed.`, stream: 'stdout' });
-                pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, index: currentIndex, stepId: step.id });
+                pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, lifecycleState: 'skipped', index: currentIndex, stepId: step.id });
                 currentIndex++;
                 continue;
             }
@@ -765,7 +776,7 @@ async function runPipeline(
                 }
                 if (isCancelled) {
                     runStatus = 'cancelled';
-                    pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false, index: currentIndex, stepId: step.id });
+                    pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false, lifecycleState: 'cancelled', index: currentIndex, stepId: step.id });
                     break;
                 }
                 pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, index: currentIndex, stepId: step.id });
@@ -1360,6 +1371,17 @@ async function runPipeline(
             let finalAttempt = 1;
             for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
                 finalAttempt = attempt;
+                if (attempt > 1) {
+                    pipelineEventBus.emitStepLifecycle({
+                        runId,
+                        intentId,
+                        stepId: compiledStep.id,
+                        index: currentIndex,
+                        attempt,
+                        state: 'running',
+                        timestamp: Date.now()
+                    });
+                }
                 let timeoutHandle: NodeJS.Timeout | undefined;
                 try {
                     const timedResult = await Promise.race([
@@ -1404,6 +1426,15 @@ async function runPipeline(
 
                 if (attempt < retryPolicy.maxAttempts) {
                     const delayMs = computeRetryDelayMs(retryPolicy, attempt);
+                    pipelineEventBus.emitStepLifecycle({
+                        runId,
+                        intentId,
+                        stepId: compiledStep.id,
+                        index: currentIndex,
+                        attempt,
+                        state: 'retrying',
+                        timestamp: Date.now()
+                    });
                     pipelineEventBus.emit({
                         type: 'stepLog',
                         runId,
@@ -1442,7 +1473,17 @@ async function runPipeline(
                 variableCache.set(errorPolicy.captureErrorVar, JSON.stringify(capturedError));
             }
 
-            pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, timestamp: Date.now(), success: ok, index: currentIndex, stepId: compiledStep.id });
+            pipelineEventBus.emit({
+                type: 'stepEnd',
+                runId,
+                intentId,
+                timestamp: Date.now(),
+                success: ok,
+                lifecycleState: isCancelled ? 'cancelled' : (ok ? 'succeeded' : 'failed'),
+                attempt: finalAttempt,
+                index: currentIndex,
+                stepId: compiledStep.id
+            });
 
             if (isCancelled) {
                 runStatus = 'cancelled';

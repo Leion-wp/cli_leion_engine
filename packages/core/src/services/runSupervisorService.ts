@@ -12,6 +12,14 @@ import {
     RUN_LOG_MAX_RESPONSE_BYTES,
     RUN_LOG_MAX_SCAN_BYTES
 } from '../runLogContract';
+import {
+    DurableStepLifecyclePayload,
+    STEP_LIFECYCLE_EVENT_TYPE,
+    STEP_LIFECYCLE_EVENT_VERSION,
+    StepLifecycleState,
+    isStepLifecycleState,
+    stableLogicalExecutionId
+} from '../stepLifecycleContract';
 
 export type RunStatus =
     | 'starting'
@@ -31,6 +39,7 @@ export type DetachedRunState = {
     pipeline: string;
     pipelinePath?: string;
     pipelineHash?: string;
+    planId?: string;
     from?: string;
     dryRun: boolean;
     status: RunStatus;
@@ -68,8 +77,18 @@ export type RunLogEvent = RunEventRecord & {
     run_id: string;
     detached_run_id: string;
     correlation_id?: string;
-    step_id?: string;
-    source_node_id?: string;
+    event_type?: string;
+    runtime_run_id?: string;
+    logical_execution_id?: string;
+    attempt?: number;
+    state?: StepLifecycleState;
+    step_id?: string | null;
+    source_node_id?: string | null;
+    pipeline_hash?: string | null;
+    pipeline_path?: string | null;
+    plan_id?: string | null;
+    origin_timestamp?: string | null;
+    persisted_timestamp?: string | null;
 };
 
 export type RunLogPage = {
@@ -363,6 +382,66 @@ const EVENT_PAYLOAD_FIELDS = [
     'dryRun', 'code'
 ] as const;
 
+const LIFECYCLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const LIFECYCLE_PLAN_PATTERN = /^(?!^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$))[A-Za-z0-9](?:[A-Za-z0-9._@+-]{0,254}[A-Za-z0-9_@+-])?$/i;
+const LIFECYCLE_TIMESTAMP_MAX = 8_640_000_000_000_000;
+
+function lifecycleId(value: any): string | null {
+    const normalized = String(value || '').trim();
+    return LIFECYCLE_ID_PATTERN.test(normalized) ? normalized : null;
+}
+
+function lifecycleTimestamp(value: any): number | null {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= LIFECYCLE_TIMESTAMP_MAX
+        ? Math.floor(parsed)
+        : null;
+}
+
+export function projectStepLifecyclePayload(value: any): DurableStepLifecyclePayload {
+    const attempt = Number(value?.attempt);
+    const originTimestamp = lifecycleTimestamp(value?.originTimestamp);
+    const persistedTimestamp = lifecycleTimestamp(value?.persistedTimestamp);
+    const pipelineHash = typeof value?.pipelineHash === 'string' && /^[a-f0-9]{64}$/.test(value.pipelineHash)
+        ? value.pipelineHash
+        : null;
+    const pipelinePath = typeof value?.pipelinePath === 'string'
+        && Buffer.byteLength(value.pipelinePath, 'utf8') <= 4096
+        && path.isAbsolute(value.pipelinePath)
+        ? path.normalize(value.pipelinePath)
+        : null;
+    const planId = typeof value?.planId === 'string' && LIFECYCLE_PLAN_PATTERN.test(value.planId)
+        ? value.planId
+        : null;
+    const structurallyComplete = value?.eventType === STEP_LIFECYCLE_EVENT_TYPE
+        && value?.eventVersion === STEP_LIFECYCLE_EVENT_VERSION
+        && lifecycleId(value?.runtimeRunId) !== null
+        && lifecycleId(value?.detachedRunId) !== null
+        && lifecycleId(value?.logicalExecutionId) !== null
+        && Number.isSafeInteger(attempt)
+        && attempt > 0
+        && isStepLifecycleState(value?.state)
+        && originTimestamp !== null
+        && persistedTimestamp !== null
+        && persistedTimestamp >= originTimestamp;
+    return {
+        eventType: STEP_LIFECYCLE_EVENT_TYPE,
+        eventVersion: STEP_LIFECYCLE_EVENT_VERSION,
+        runtimeRunId: lifecycleId(value?.runtimeRunId) || 'unknown',
+        detachedRunId: lifecycleId(value?.detachedRunId) || 'unknown',
+        logicalExecutionId: lifecycleId(value?.logicalExecutionId) || 'unknown',
+        attempt: Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 1,
+        stepId: lifecycleId(value?.stepId),
+        sourceNodeId: lifecycleId(value?.sourceNodeId),
+        pipelineHash,
+        pipelinePath,
+        planId,
+        state: structurallyComplete ? value.state : 'unknown',
+        originTimestamp,
+        persistedTimestamp: persistedTimestamp ?? 0
+    };
+}
+
 const JULES_ERROR_CODES = new Set([
     'JULES_NOT_CONFIGURED', 'JULES_REQUEST_INVALID', 'JULES_PLAN_APPROVAL_REQUIRED',
     'JULES_AUTH_FAILED', 'JULES_NOT_FOUND', 'JULES_RATE_LIMITED',
@@ -372,6 +451,7 @@ const JULES_ERROR_CODES = new Set([
 
 export function projectRunEventPayload(eventType: string, value: any): Record<string, any> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    if (eventType === STEP_LIFECYCLE_EVENT_TYPE) return projectStepLifecyclePayload(value);
     const projected: Record<string, any> = {};
     for (const key of EVENT_PAYLOAD_FIELDS) {
         const entry = value[key];
@@ -539,6 +619,7 @@ function locateLegacyCursorOffset(
 }
 
 function safeLogPayload(eventType: string, value: any): Record<string, any> {
+    if (eventType === STEP_LIFECYCLE_EVENT_TYPE) return projectStepLifecyclePayload(value);
     const projected = projectRunEventPayload(eventType, value);
     const safe: Record<string, any> = {};
     const idFields = new Set(['runId', 'intentId', 'nodeId', 'stepId', 'detachedRunId', 'correlationId']);
@@ -651,9 +732,25 @@ function projectPersistedRunLogEvent(
     const timestamp = Number(parsed.ts);
     const validTimestamp = Number.isFinite(timestamp) && timestamp >= 0 && timestamp <= 8_640_000_000_000_000;
     const safeTimestamp = validTimestamp ? Math.floor(timestamp) : 0;
-    const payload = safeLogPayload(rawType, parsed.payload);
+    let payload = safeLogPayload(rawType, parsed.payload);
     const persistedRunId = String(parsed.runId || '').trim();
     const safeRunId = LOG_ID_PATTERN.test(persistedRunId) ? persistedRunId : detachedRunId;
+    if (rawType === STEP_LIFECYCLE_EVENT_TYPE) {
+        const lifecyclePayload = payload as DurableStepLifecyclePayload;
+        payload = {
+            ...lifecyclePayload,
+            runtimeRunId: safeRunId,
+            detachedRunId,
+            logicalExecutionId: lifecyclePayload.logicalExecutionId === 'unknown'
+                ? stableLogicalExecutionId(detachedRunId, 'unknown', byteOffset)
+                : lifecyclePayload.logicalExecutionId
+        };
+    }
+    const lifecycle = rawType === STEP_LIFECYCLE_EVENT_TYPE
+        ? payload as DurableStepLifecyclePayload
+        : undefined;
+    const originTimestamp = lifecycle ? lifecycleTimestamp(lifecycle.originTimestamp) : safeTimestamp;
+    const persistedTimestamp = validTimestamp ? new Date(safeTimestamp).toISOString() : null;
     return {
         eventVersion: RUN_LOG_EVENT_VERSION,
         ts: safeTimestamp,
@@ -661,14 +758,29 @@ function projectPersistedRunLogEvent(
         type: rawType,
         payload,
         event_id: eventId,
-        occurred_at: validTimestamp ? new Date(safeTimestamp).toISOString() : null,
+        occurred_at: originTimestamp === null ? null : new Date(originTimestamp).toISOString(),
         event_version: RUN_LOG_EVENT_VERSION,
         sequence,
         run_id: safeRunId,
         detached_run_id: detachedRunId,
         ...(correlationId ? { correlation_id: correlationId } : {}),
-        ...(typeof payload.stepId === 'string' ? { step_id: payload.stepId } : {}),
-        ...(typeof payload.nodeId === 'string' ? { source_node_id: payload.nodeId } : {})
+        ...(lifecycle ? {
+            event_type: STEP_LIFECYCLE_EVENT_TYPE,
+            runtime_run_id: lifecycle.runtimeRunId,
+            logical_execution_id: lifecycle.logicalExecutionId,
+            attempt: lifecycle.attempt,
+            state: lifecycle.state,
+            step_id: lifecycle.stepId,
+            source_node_id: lifecycle.sourceNodeId,
+            pipeline_hash: lifecycle.pipelineHash,
+            pipeline_path: lifecycle.pipelinePath,
+            plan_id: lifecycle.planId,
+            origin_timestamp: originTimestamp === null ? null : new Date(originTimestamp).toISOString(),
+            persisted_timestamp: persistedTimestamp
+        } : {
+            ...(typeof payload.stepId === 'string' ? { step_id: payload.stepId } : {}),
+            ...(typeof payload.nodeId === 'string' ? { source_node_id: payload.nodeId } : {})
+        })
     };
 }
 
@@ -1051,6 +1163,9 @@ export class RunSupervisorService {
         }
         const pipelinePath = source.path;
         const pipelineHash = source.contentHash;
+        const planId = source.approvedBundleHash === pipelineHash
+            ? path.basename(path.dirname(pipelinePath))
+            : undefined;
         const from = String(options.from || '').trim() || undefined;
         const dryRun = options.dryRun === true;
         const fingerprint = requestFingerprint({
@@ -1086,6 +1201,7 @@ export class RunSupervisorService {
                 pipeline,
                 pipelinePath,
                 pipelineHash,
+                ...(planId ? { planId } : {}),
                 from,
                 dryRun,
                 status: 'starting',

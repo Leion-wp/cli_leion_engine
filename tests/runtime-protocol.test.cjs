@@ -103,6 +103,31 @@ test('catalog preserves shared registration descriptors and exposes conservative
     cancellationDominant: true,
     terminalProcessExitRequired: true
   });
+  assert.deepEqual(envelope.runtime.contracts.step_lifecycle, {
+    version: '1',
+    eventType: 'step_lifecycle',
+    eventVersion: 1,
+    states: ['running', 'retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+    terminalStates: ['succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+    transitions: {
+      unknown: [],
+      running: ['retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+      retrying: ['running', 'failed', 'cancelled', 'unknown'],
+      succeeded: [], failed: [], cancelled: [], skipped: []
+    },
+    compatibilityEvents: { start: 'stepStart', end: 'stepEnd' },
+    terminalTransitions: 'forbidden',
+    retryAttempt: 'increment_on_running',
+    incompleteTransition: 'unknown',
+    missingAttribution: 'null',
+    identityFields: [
+      'runtime_run_id', 'detached_run_id', 'logical_execution_id',
+      'attempt', 'step_id', 'source_node_id'
+    ],
+    provenanceFields: ['pipeline_hash', 'pipeline_path', 'plan_id'],
+    timestampFields: ['origin_timestamp', 'persisted_timestamp'],
+    cursor: { contract: 'run_logs', replay: 'stable_event_id_and_sequence' }
+  });
   assert.deepEqual(envelope.runtime.contracts.run_logs.limits, {
     default: 100,
     max: 200,

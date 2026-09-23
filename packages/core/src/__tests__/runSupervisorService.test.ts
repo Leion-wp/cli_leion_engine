@@ -5,6 +5,11 @@ import * as os from 'os';
 import * as path from 'path';
 import * as cp from 'child_process';
 import { createHash } from 'crypto';
+import { pipelineEventBus } from '../eventBus';
+import {
+    STEP_LIFECYCLE_CONTRACT,
+    StepLifecycleMachine
+} from '../stepLifecycleContract';
 import {
     RUN_LOG_MAX_LIMIT,
     RUN_LOG_MAX_RECORD_BYTES,
@@ -23,10 +28,132 @@ import {
     executionClaimFilePath,
     stateFilePath,
     projectRunResult,
+    projectStepLifecyclePayload,
     sanitizeWorkerError,
     tryAcquireExecutionClaim,
     writeJsonFile
 } from '../services/runSupervisorService';
+
+test('step lifecycle contract is closed and terminal executions never transition again', () => {
+    assert.deepEqual(JSON.parse(JSON.stringify(STEP_LIFECYCLE_CONTRACT)), {
+        version: '1',
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        states: ['running', 'retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+        terminalStates: ['succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+        transitions: {
+            unknown: [],
+            running: ['retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+            retrying: ['running', 'failed', 'cancelled', 'unknown'],
+            succeeded: [],
+            failed: [],
+            cancelled: [],
+            skipped: []
+        },
+        compatibilityEvents: { start: 'stepStart', end: 'stepEnd' },
+        terminalTransitions: 'forbidden',
+        retryAttempt: 'increment_on_running',
+        incompleteTransition: 'unknown',
+        missingAttribution: 'null',
+        identityFields: [
+            'runtime_run_id', 'detached_run_id', 'logical_execution_id',
+            'attempt', 'step_id', 'source_node_id'
+        ],
+        provenanceFields: ['pipeline_hash', 'pipeline_path', 'plan_id'],
+        timestampFields: ['origin_timestamp', 'persisted_timestamp'],
+        cursor: { contract: 'run_logs', replay: 'stable_event_id_and_sequence' }
+    });
+
+    const machine = new StepLifecycleMachine();
+    const id = 'step_retry_machine';
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 1, state: 'running' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 1, state: 'retrying' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'running' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'succeeded' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'failed' }), false);
+    const unknownId = 'step_unknown_terminal';
+    assert.equal(machine.accept({ logicalExecutionId: unknownId, attempt: 1, state: 'unknown' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: unknownId, attempt: 1, state: 'running' }), false);
+});
+
+test('legacy step events derive one canonical lifecycle and explicit retry attempts', () => {
+    const runId = `runtime_${Date.now()}_legacy`;
+    const intentId = 'intent_retry';
+    const events: any[] = [];
+    const subscription = pipelineEventBus.on((event) => events.push(event));
+    try {
+        pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'compile', index: 3, timestamp: 100 });
+        pipelineEventBus.emitStepLifecycle({ runId, intentId, stepId: 'compile', index: 3, attempt: 1, state: 'retrying', timestamp: 110 });
+        pipelineEventBus.emitStepLifecycle({ runId, intentId, stepId: 'compile', index: 3, attempt: 2, state: 'running', timestamp: 120 });
+        pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, stepId: 'compile', index: 3, attempt: 2, timestamp: 130, success: true });
+    } finally {
+        subscription.dispose();
+    }
+    assert.deepEqual(events.map((event) => event.type), [
+        'step_lifecycle', 'stepStart', 'step_lifecycle', 'step_lifecycle', 'step_lifecycle', 'stepEnd'
+    ]);
+    const lifecycle = events.filter((event) => event.type === 'step_lifecycle');
+    assert.deepEqual(lifecycle.map((event) => [event.state, event.attempt]), [
+        ['running', 1], ['retrying', 1], ['running', 2], ['succeeded', 2]
+    ]);
+    assert.equal(new Set(lifecycle.map((event) => event.logicalExecutionId)).size, 1);
+});
+
+test('pipeline end closes an incomplete execution as one terminal unknown', () => {
+    const runId = `runtime_${Date.now()}_incomplete`;
+    const otherRunId = `${runId}_other`;
+    const intentId = 'intent_incomplete';
+    const events: any[] = [];
+    const subscription = pipelineEventBus.on((event) => events.push(event));
+    try {
+        pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'incomplete', timestamp: 200 });
+        pipelineEventBus.emit({ type: 'stepStart', runId: otherRunId, intentId: 'intent_complete', stepId: 'complete', timestamp: 201 });
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 210, success: false, status: 'failure' });
+        pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, stepId: 'incomplete', timestamp: 220, success: true });
+        pipelineEventBus.emit({ type: 'stepEnd', runId: otherRunId, intentId: 'intent_complete', stepId: 'complete', timestamp: 221, success: true });
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId: otherRunId, timestamp: 230, success: true, status: 'success' });
+    } finally {
+        subscription.dispose();
+    }
+    const lifecycle = events.filter((event) => event.type === 'step_lifecycle');
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runId).map((event) => event.state),
+        ['running', 'unknown']
+    );
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === otherRunId).map((event) => event.state),
+        ['running', 'succeeded']
+    );
+    assert.equal(events.filter((event) => event.type === 'stepEnd').length, 2);
+});
+
+test('an unattributed or incomplete lifecycle projects explicit nulls and terminal unknown', () => {
+    const projected = projectStepLifecyclePayload({
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId: 'runtime_projection',
+        detachedRunId: 'run_projection',
+        logicalExecutionId: 'step_projection',
+        attempt: 0,
+        stepId: '',
+        sourceNodeId: 'invented node',
+        pipelineHash: 'not-a-hash',
+        pipelinePath: 'relative.intent.json',
+        planId: '../invented',
+        state: 'succeeded',
+        originTimestamp: 'invalid',
+        persistedTimestamp: 200
+    });
+    assert.equal(projected.state, 'unknown');
+    assert.equal(projected.attempt, 1);
+    assert.equal(projected.stepId, null);
+    assert.equal(projected.sourceNodeId, null);
+    assert.equal(projected.pipelineHash, null);
+    assert.equal(projected.pipelinePath, null);
+    assert.equal(projected.planId, null);
+    assert.equal(projected.originTimestamp, null);
+    assert.equal(projected.persistedTimestamp, 200);
+});
 
 function createWorkspace(): string {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'leion-correlation-'));
@@ -1638,6 +1765,195 @@ test('event journal uses an allowlist and persists only hashes for log text', (t
     const safeError = sanitizeWorkerError(Object.assign(new Error('exception-secret-value'), { code: 'UPSTREAM_FAILED' }));
     assert.deepEqual(safeError, { code: 'RUN_WORKER_FAILED', message: 'Detached worker failed.' });
     assert.equal(JSON.stringify(safeError).includes('exception-secret-value'), false);
+});
+
+test('worker attributes lifecycle only from verified approved bundle facts', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_bundle';
+    const runtimeRunId = 'runtime_lifecycle_bundle';
+    const planId = 'plan_lifecycle';
+    const pipeline = {
+        name: 'lifecycle',
+        steps: [{
+            id: 'compile-step',
+            intent: 'system.setVar',
+            payload: { name: 'result', value: 'ok' },
+            meta: { sourceNodeId: 'source-node-7' }
+        }]
+    };
+    const serialized = JSON.stringify(pipeline);
+    const pipelineHash = createHash('sha256').update(serialized).digest('hex');
+    const bundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', planId);
+    fs.mkdirSync(bundleDirectory, { recursive: true });
+    const pipelinePath = path.join(bundleDirectory, `${pipelineHash}.intent.json`);
+    fs.writeFileSync(pipelinePath, serialized, 'utf8');
+    const state: DetachedRunState = {
+        detachedRunId,
+        correlationId: 'lifecycle-bundle',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: pipelinePath,
+        pipelinePath: fs.realpathSync.native(pipelinePath),
+        pipelineHash,
+        planId,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, detachedRunId), state);
+    const preloadPath = path.join(workspace, 'lifecycle-runtime.cjs');
+    const runtimeModule = path.resolve(__dirname, '..', 'coreRuntime.js');
+    const eventBusModule = path.resolve(__dirname, '..', 'eventBus.js');
+    fs.writeFileSync(preloadPath, [
+        `const bus = require(${JSON.stringify(eventBusModule)}).pipelineEventBus;`,
+        `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
+        `  async run_pipeline_data() {`,
+        `    bus.emit({ type: 'pipelineStart', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1000 });`,
+        `    bus.emit({ type: 'stepStart', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1100 });`,
+        `    bus.emit({ type: 'pipelineStart', runId: 'runtime_lifecycle_child', timestamp: 1110 });`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1120 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1130, success: true });`,
+        `    bus.emit({ type: 'pipelineEnd', runId: 'runtime_lifecycle_child', timestamp: 1140, success: true, status: 'success' });`,
+        `    bus.emit({ type: 'stepEnd', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1200, success: true });`,
+        `    bus.emit({ type: 'pipelineEnd', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1300, success: true, status: 'success' });`,
+        `    return { runId: ${JSON.stringify(runtimeRunId)}, success: true, status: 'success' };`,
+        `  }`,
+        `  pause() {} resume() {} cancel() {}`,
+        `};`
+    ].join('\n'), 'utf8');
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const result = cp.spawnSync(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', detachedRunId,
+        '--pipeline', pipelinePath,
+        '--pipeline_path', state.pipelinePath!,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+
+    const supervisor = new RunSupervisorService(workspace);
+    const page = supervisor.tail_events('lifecycle-bundle', undefined, RUN_LOG_MAX_LIMIT);
+    const lifecycle = page.events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(lifecycle.length, 4);
+    const rootLifecycle = lifecycle.filter((event) => event.runtime_run_id === runtimeRunId);
+    const childLifecycle = lifecycle.filter((event) => event.runtime_run_id === 'runtime_lifecycle_child');
+    assert.deepEqual(rootLifecycle.map((event) => event.state), ['running', 'succeeded']);
+    assert.deepEqual(childLifecycle.map((event) => event.state), ['running', 'succeeded']);
+    assert.equal(page.events.some((event) => event.type === 'stepStart' || event.type === 'stepEnd'), false);
+    assert.equal(new Set(rootLifecycle.map((event) => event.logical_execution_id)).size, 1);
+    assert.equal(new Set(childLifecycle.map((event) => event.logical_execution_id)).size, 1);
+    assert.notEqual(rootLifecycle[0].logical_execution_id, childLifecycle[0].logical_execution_id);
+    for (const event of rootLifecycle) {
+        assert.equal(event.event_type, 'step_lifecycle');
+        assert.equal(event.event_version, 1);
+        assert.equal(event.runtime_run_id, runtimeRunId);
+        assert.equal(event.run_id, runtimeRunId);
+        assert.equal(event.detached_run_id, detachedRunId);
+        assert.equal(event.attempt, 1);
+        assert.equal(event.step_id, 'compile-step');
+        assert.equal(event.source_node_id, 'source-node-7');
+        assert.equal(event.pipeline_hash, pipelineHash);
+        assert.equal(event.pipeline_path, state.pipelinePath);
+        assert.equal(event.plan_id, planId);
+        assert.ok(event.origin_timestamp);
+        assert.ok(event.persisted_timestamp);
+        assert.equal(event.occurred_at, event.origin_timestamp);
+        assert.ok(Date.parse(event.persisted_timestamp!) >= Date.parse(event.origin_timestamp!));
+    }
+    assert.ok(childLifecycle.every((event) => event.source_node_id === null));
+    assert.ok(childLifecycle.every((event) => event.pipeline_hash === null));
+    assert.ok(childLifecycle.every((event) => event.pipeline_path === null));
+    assert.ok(childLifecycle.every((event) => event.plan_id === null));
+    assert.equal(rootLifecycle[0].origin_timestamp, new Date(1100).toISOString());
+    assert.equal(rootLifecycle[1].origin_timestamp, new Date(1200).toISOString());
+
+    const authorRunId = 'run_lifecycle_author';
+    const authorPath = path.join(workspace, 'pipeline', 'demo.intent.json');
+    fs.writeFileSync(authorPath, serialized, 'utf8');
+    const canonicalAuthorPath = fs.realpathSync.native(authorPath);
+    const authorHash = createHash('sha256').update(serialized).digest('hex');
+    const authorState: DetachedRunState = {
+        detachedRunId: authorRunId,
+        correlationId: 'lifecycle-author',
+        workspaceRoot: state.workspaceRoot,
+        pipeline: 'demo',
+        pipelinePath: canonicalAuthorPath,
+        pipelineHash: authorHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, authorRunId), authorState);
+    const authorResult = cp.spawnSync(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', authorState.workspaceRoot,
+        '--run_id', authorRunId,
+        '--pipeline', 'demo',
+        '--pipeline_path', canonicalAuthorPath,
+        '--pipeline_hash', authorHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+    assert.equal(authorResult.status, 0, authorResult.stderr);
+    const authorLifecycle = supervisor.tail_events('lifecycle-author', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle' && event.runtime_run_id === runtimeRunId);
+    assert.equal(authorLifecycle.length, 2);
+    assert.ok(authorLifecycle.every((event) => event.step_id === 'compile-step'));
+    assert.ok(authorLifecycle.every((event) => event.source_node_id === null));
+    assert.ok(authorLifecycle.every((event) => event.plan_id === null));
+    assert.ok(authorLifecycle.every((event) => event.pipeline_hash === authorHash));
+    assert.ok(authorLifecycle.every((event) => event.pipeline_path === canonicalAuthorPath));
+});
+
+test('lifecycle cursor replay preserves identities, null attribution, and timestamps', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_cursor';
+    seedRunState(workspace, detachedRunId, 'lifecycle-cursor');
+    const eventPath = eventsFilePath(workspace, detachedRunId);
+    const payload = {
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId: 'runtime_cursor',
+        detachedRunId,
+        logicalExecutionId: 'step_cursor_execution',
+        attempt: 1,
+        stepId: null,
+        sourceNodeId: null,
+        pipelineHash: null,
+        pipelinePath: null,
+        planId: null,
+        state: 'unknown',
+        originTimestamp: 1_700_000_000_000,
+        persistedTimestamp: 1_700_000_000_100
+    };
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: payload.persistedTimestamp,
+        runId: payload.runtimeRunId,
+        type: 'step_lifecycle',
+        payload
+    });
+    const supervisor = new RunSupervisorService(workspace);
+    const first = supervisor.tail_events('lifecycle-cursor', undefined, 1);
+    const replay = supervisor.tail_events('lifecycle-cursor', undefined, 1);
+    assert.deepEqual(replay, first);
+    assert.equal(first.events.length, 1);
+    assert.equal(first.events[0].event_type, 'step_lifecycle');
+    assert.equal(first.events[0].state, 'unknown');
+    assert.equal(first.events[0].step_id, null);
+    assert.equal(first.events[0].source_node_id, null);
+    assert.equal(first.events[0].pipeline_hash, null);
+    assert.equal(first.events[0].pipeline_path, null);
+    assert.equal(first.events[0].plan_id, null);
+    assert.equal(first.events[0].origin_timestamp, new Date(payload.originTimestamp).toISOString());
+    assert.equal(first.events[0].persisted_timestamp, new Date(payload.persistedTimestamp).toISOString());
+    assert.deepEqual(supervisor.tail_events('lifecycle-cursor', first.next_cursor, 1).events, []);
 });
 
 test('run_logs returns stable opaque cursors and event identities across retries and legacy cursors', (t) => {
