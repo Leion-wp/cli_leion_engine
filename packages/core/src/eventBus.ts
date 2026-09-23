@@ -100,11 +100,12 @@ export type PipelineEvent =
 type Listener = (event: PipelineEvent) => void;
 
 class EventBus {
+    private static readonly CLOSED_RUN_RETENTION = 1024;
     private listeners: Listener[] = [];
     private readonly lifecycle = new StepLifecycleMachine();
     private readonly lifecycleIdsByRun = new Map<string, Set<string>>();
-    // Pipeline-end cleanup removes every per-step position. One compact run tombstone
-    // remains so an arbitrarily late event can never reopen a terminal execution.
+    // Pipeline-end cleanup removes every per-step position. Retained run tombstones
+    // block late events and are evicted in deterministic insertion order.
     private readonly closedRuns = new Map<string, true>();
     private readonly activeLifecycle = new Map<string, {
         runId: string;
@@ -259,6 +260,11 @@ class EventBus {
             }
             this.lifecycleIdsByRun.delete(event.runId);
             this.closedRuns.set(event.runId, true);
+            while (this.closedRuns.size > EventBus.CLOSED_RUN_RETENTION) {
+                const oldest = this.closedRuns.keys().next().value as string | undefined;
+                if (!oldest) break;
+                this.closedRuns.delete(oldest);
+            }
         }
         this.dispatch(event);
     }

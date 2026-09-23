@@ -88,6 +88,7 @@ test('legacy step events derive one canonical lifecycle and explicit retry attem
         pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, stepId: 'compile', index: 3, attempt: 2, timestamp: 130, success: true });
     } finally {
         subscription.dispose();
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 131, success: true, status: 'success' });
     }
     assert.deepEqual(events.map((event) => event.type), [
         'step_lifecycle', 'stepStart', 'step_lifecycle', 'step_lifecycle', 'step_lifecycle', 'stepEnd'
@@ -125,6 +126,84 @@ test('pipeline end closes an incomplete execution as one terminal unknown', () =
         ['running', 'succeeded']
     );
     assert.equal(events.filter((event) => event.type === 'stepEnd').length, 2);
+});
+
+test('pipeline end bounds tombstones and releases lifecycle tracking without cross-run contamination', () => {
+    const bus = pipelineEventBus as any;
+    const prefix = `runtime_${Date.now()}_retention_${Math.random().toString(36).slice(2)}`;
+    let firstRunId = '';
+    let retainedRunId = '';
+
+    for (let index = 0; index < 1056; index++) {
+        const runId = `${prefix}_${index}`;
+        if (index === 0) firstRunId = runId;
+        retainedRunId = runId;
+        pipelineEventBus.emit({
+            type: 'stepStart',
+            runId,
+            intentId: `intent_${index}`,
+            stepId: `step_${index}`,
+            timestamp: 300 + index
+        });
+        pipelineEventBus.emit({
+            type: 'pipelineEnd',
+            runId,
+            timestamp: 400 + index,
+            success: false,
+            status: 'failure'
+        });
+    }
+
+    assert.equal(bus.closedRuns.size, 1024);
+    assert.equal(bus.closedRuns.has(firstRunId), false);
+    assert.equal(bus.closedRuns.has(retainedRunId), true);
+    assert.equal(bus.lifecycle.positions.size, 0);
+    assert.equal(bus.activeLifecycle.size, 0);
+    assert.equal(bus.lifecycleIdsByRun.size, 0);
+
+    const isolatedRunId = `${prefix}_isolated`;
+    const lifecycleEvents: any[] = [];
+    const subscription = pipelineEventBus.on((event) => {
+        if (event.type === 'step_lifecycle') lifecycleEvents.push(event);
+    });
+    try {
+        pipelineEventBus.emit({
+            type: 'stepStart',
+            runId: isolatedRunId,
+            intentId: 'intent_isolated',
+            stepId: 'step_isolated',
+            timestamp: 2000
+        });
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: retainedRunId,
+            intentId: 'intent_late',
+            stepId: 'step_late',
+            attempt: 1,
+            state: 'running',
+            timestamp: 2001
+        }), false);
+        assert.deepEqual(
+            lifecycleEvents.map((event) => [event.runId, event.state]),
+            [[isolatedRunId, 'running']]
+        );
+        assert.equal(bus.lifecycle.positions.size, 1);
+        assert.equal(bus.activeLifecycle.size, 1);
+        assert.equal(bus.lifecycleIdsByRun.size, 1);
+        pipelineEventBus.emit({
+            type: 'pipelineEnd',
+            runId: isolatedRunId,
+            timestamp: 2002,
+            success: true,
+            status: 'success'
+        });
+    } finally {
+        subscription.dispose();
+    }
+
+    assert.equal(bus.closedRuns.size, 1024);
+    assert.equal(bus.lifecycle.positions.size, 0);
+    assert.equal(bus.activeLifecycle.size, 0);
+    assert.equal(bus.lifecycleIdsByRun.size, 0);
 });
 
 test('an unattributed or incomplete lifecycle projects explicit nulls and terminal unknown', () => {
