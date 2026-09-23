@@ -53,6 +53,22 @@ test('step lifecycle contract is closed and terminal executions never transition
             skipped: []
         },
         compatibilityEvents: { start: 'stepStart', end: 'stepEnd' },
+        runtimeRunId: {
+            uniqueness: 'required',
+            generator: 'time_plus_secure_random',
+            reuse: 'invalid'
+        },
+        scope: {
+            opensOn: 'pipelineStart',
+            closesOn: 'pipelineEnd',
+            lifecycleOutsideOpenRun: 'rejected',
+            legacyCompatibilityOutsideOpenRun: 'dispatched'
+        },
+        closedRunRetention: {
+            strategy: 'fifo',
+            max: 1024,
+            duplicatePipelineStart: 'rejected_while_retained'
+        },
         terminalTransitions: 'forbidden',
         retryAttempt: 'increment_on_running',
         incompleteTransition: 'unknown',
@@ -101,6 +117,68 @@ test('legacy step events derive one canonical lifecycle and explicit retry attem
         ['running', 1], ['retrying', 1], ['running', 2], ['succeeded', 2]
     ]);
     assert.equal(new Set(lifecycle.map((event) => event.logicalExecutionId)).size, 1);
+});
+
+test('legacy step events outside an open run remain observable without lifecycle derivation', () => {
+    const prefix = `runtime_${Date.now()}_legacy_scope_${Math.random().toString(36).slice(2)}`;
+    const unopenedRunId = `${prefix}_unopened`;
+    const closedRunId = `${prefix}_closed`;
+    pipelineEventBus.emit({ type: 'pipelineStart', runId: closedRunId, timestamp: 140 });
+    pipelineEventBus.emit({
+        type: 'pipelineEnd',
+        runId: closedRunId,
+        timestamp: 141,
+        success: true,
+        status: 'success'
+    });
+
+    const unopenedStart = {
+        type: 'stepStart' as const,
+        runId: unopenedRunId,
+        intentId: 'unopened-start',
+        stepId: 'unopened-step',
+        timestamp: 142
+    };
+    const unopenedEnd = {
+        type: 'stepEnd' as const,
+        runId: unopenedRunId,
+        intentId: 'unopened-end',
+        stepId: 'unopened-step',
+        timestamp: 143,
+        success: true
+    };
+    const closedStart = {
+        type: 'stepStart' as const,
+        runId: closedRunId,
+        intentId: 'closed-start',
+        stepId: 'closed-step',
+        timestamp: 144
+    };
+    const closedEnd = {
+        type: 'stepEnd' as const,
+        runId: closedRunId,
+        intentId: 'closed-end',
+        stepId: 'closed-step',
+        timestamp: 145,
+        success: false
+    };
+    const observed: any[] = [];
+    const subscription = pipelineEventBus.on((event) => observed.push(event));
+    try {
+        pipelineEventBus.emit(unopenedStart);
+        pipelineEventBus.emit(unopenedEnd);
+        pipelineEventBus.emit(closedStart);
+        pipelineEventBus.emit(closedEnd);
+    } finally {
+        subscription.dispose();
+    }
+
+    assert.deepEqual(observed.map((event) => event.type), ['stepStart', 'stepEnd', 'stepStart', 'stepEnd']);
+    assert.equal(observed.some((event) => event.type === 'step_lifecycle'), false);
+    assert.equal(observed[0], unopenedStart);
+    assert.equal(observed[1], unopenedEnd);
+    assert.equal(observed[2], closedStart);
+    assert.equal(observed[3], closedEnd);
 });
 
 test('pipeline end closes an incomplete execution as one terminal unknown', () => {
@@ -194,8 +272,14 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
             type: 'stepStart', runId: retainedRunId, intentId: 'legacy_retained_late',
             stepId: 'legacy_retained_late', timestamp: 1999
         });
-        assert.equal(observedEvents.some((event) => event.runId === firstRunId), false);
-        assert.equal(observedEvents.filter((event) => event.runId === retainedRunId).length, 1);
+        assert.deepEqual(
+            observedEvents.filter((event) => event.runId === firstRunId).map((event) => event.type),
+            ['stepStart']
+        );
+        assert.deepEqual(
+            observedEvents.filter((event) => event.runId === retainedRunId).map((event) => event.type),
+            ['pipelineStart', 'stepStart']
+        );
         pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000 });
         pipelineEventBus.emit({
             type: 'stepStart',
@@ -1964,12 +2048,16 @@ test('worker attributes lifecycle only from verified approved bundle facts', (t)
         `const bus = require(${JSON.stringify(eventBusModule)}).pipelineEventBus;`,
         `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
         `  async run_pipeline_data() {`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_unopened', intentId: 'legacy-unopened', stepId: 'compile-step', timestamp: 990 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_unopened', intentId: 'legacy-unopened', stepId: 'compile-step', timestamp: 991, success: true });`,
         `    bus.emit({ type: 'pipelineStart', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1000 });`,
         `    bus.emit({ type: 'stepStart', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1100 });`,
         `    bus.emit({ type: 'pipelineStart', runId: 'runtime_lifecycle_child', timestamp: 1110 });`,
         `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1120 });`,
         `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1130, success: true });`,
         `    bus.emit({ type: 'pipelineEnd', runId: 'runtime_lifecycle_child', timestamp: 1140, success: true, status: 'success' });`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_child', intentId: 'legacy-closed', stepId: 'compile-step', timestamp: 1150 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_child', intentId: 'legacy-closed', stepId: 'compile-step', timestamp: 1160, success: true });`,
         `    bus.emit({ type: 'stepEnd', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1200, success: true });`,
         `    bus.emit({ type: 'pipelineEnd', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1300, success: true, status: 'success' });`,
         `    return { runId: ${JSON.stringify(runtimeRunId)}, success: true, status: 'success' };`,

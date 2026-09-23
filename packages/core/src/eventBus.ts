@@ -202,7 +202,10 @@ class EventBus {
             return;
         }
         if (event.type === 'stepStart') {
-            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return;
+            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) {
+                this.dispatch(event);
+                return;
+            }
             this.emitStepLifecycle({
                 runId: event.runId,
                 intentId: event.intentId,
@@ -217,7 +220,10 @@ class EventBus {
             return;
         }
         if (event.type === 'stepEnd') {
-            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return;
+            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) {
+                this.dispatch(event);
+                return;
+            }
             const logicalExecutionId = this.lifecycleIdentity(event);
             const position = this.lifecycle.position(logicalExecutionId);
             const attempt = Number.isSafeInteger(event.attempt) && Number(event.attempt) > 0

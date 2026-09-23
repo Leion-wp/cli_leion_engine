@@ -117,6 +117,22 @@ test('catalog preserves shared registration descriptors and exposes conservative
       succeeded: [], failed: [], cancelled: [], skipped: []
     },
     compatibilityEvents: { start: 'stepStart', end: 'stepEnd' },
+    runtimeRunId: {
+      uniqueness: 'required',
+      generator: 'time_plus_secure_random',
+      reuse: 'invalid'
+    },
+    scope: {
+      opensOn: 'pipelineStart',
+      closesOn: 'pipelineEnd',
+      lifecycleOutsideOpenRun: 'rejected',
+      legacyCompatibilityOutsideOpenRun: 'dispatched'
+    },
+    closedRunRetention: {
+      strategy: 'fifo',
+      max: 1024,
+      duplicatePipelineStart: 'rejected_while_retained'
+    },
     terminalTransitions: 'forbidden',
     retryAttempt: 'increment_on_running',
     incompleteTransition: 'unknown',
