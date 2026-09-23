@@ -6,7 +6,7 @@ import {
     StepLifecycleMachine,
     StepLifecycleState,
     isTerminalStepLifecycleState,
-    stableLogicalExecutionId
+    runtimeLogicalExecutionId
 } from './stepLifecycleContract';
 
 export type PipelineEvent =
@@ -104,6 +104,7 @@ class EventBus {
     private listeners: Listener[] = [];
     private readonly lifecycle = new StepLifecycleMachine();
     private readonly lifecycleIdsByRun = new Map<string, Set<string>>();
+    private readonly openRuns = new Set<string>();
     // Pipeline-end cleanup removes every per-step position. Retained run tombstones
     // block late events and are evicted in deterministic insertion order.
     private readonly closedRuns = new Map<string, true>();
@@ -136,9 +137,10 @@ class EventBus {
         logicalExecutionId?: string;
     }): string {
         const explicit = String(event.logicalExecutionId || '').trim();
-        if (explicit) return explicit;
-        return stableLogicalExecutionId(
+        if (explicit) return runtimeLogicalExecutionId(event.runId, 'explicit', explicit);
+        return runtimeLogicalExecutionId(
             event.runId,
+            'derived',
             event.intentId || '',
             event.stepId || '',
             Number.isSafeInteger(event.index) ? event.index : ''
@@ -169,7 +171,11 @@ class EventBus {
             timestamp: Number.isFinite(input.timestamp) ? Math.floor(Number(input.timestamp)) : Date.now(),
             ...(Number.isSafeInteger(input.index) ? { index: input.index } : {})
         };
-        if (this.closedRuns.has(event.runId)) return false;
+        return this.emitQualifiedStepLifecycle(event);
+    }
+
+    private emitQualifiedStepLifecycle(event: StepLifecycleEvent): boolean {
+        if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return false;
         if (!this.lifecycle.accept(event)) return false;
         const runLifecycleIds = this.lifecycleIdsByRun.get(event.runId) || new Set<string>();
         runLifecycleIds.add(event.logicalExecutionId);
@@ -190,7 +196,13 @@ class EventBus {
     }
 
     emit(event: PipelineEvent): void {
+        if (event.type === 'pipelineStart') {
+            if (!this.closedRuns.has(event.runId)) this.openRuns.add(event.runId);
+            this.dispatch(event);
+            return;
+        }
         if (event.type === 'stepStart') {
+            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return;
             this.emitStepLifecycle({
                 runId: event.runId,
                 intentId: event.intentId,
@@ -205,17 +217,22 @@ class EventBus {
             return;
         }
         if (event.type === 'stepEnd') {
+            if (!this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return;
             const logicalExecutionId = this.lifecycleIdentity(event);
             const position = this.lifecycle.position(logicalExecutionId);
             const attempt = Number.isSafeInteger(event.attempt) && Number(event.attempt) > 0
                 ? Number(event.attempt)
                 : (position?.attempt || 1);
             if (!position) {
-                this.emitStepLifecycle({
+                this.emitQualifiedStepLifecycle({
+                    type: STEP_LIFECYCLE_EVENT_TYPE,
+                    eventType: STEP_LIFECYCLE_EVENT_TYPE,
+                    eventVersion: STEP_LIFECYCLE_EVENT_VERSION,
                     runId: event.runId,
                     intentId: event.intentId,
-                    stepId: event.stepId,
-                    index: event.index,
+                    stepId: String(event.stepId || '').trim() || null,
+                    sourceNodeId: null,
+                    ...(Number.isSafeInteger(event.index) ? { index: event.index } : {}),
                     logicalExecutionId,
                     attempt,
                     state: 'unknown',
@@ -225,11 +242,15 @@ class EventBus {
                 return;
             }
             const state = event.lifecycleState || (event.success ? 'succeeded' : 'failed');
-            this.emitStepLifecycle({
+            this.emitQualifiedStepLifecycle({
+                type: STEP_LIFECYCLE_EVENT_TYPE,
+                eventType: STEP_LIFECYCLE_EVENT_TYPE,
+                eventVersion: STEP_LIFECYCLE_EVENT_VERSION,
                 runId: event.runId,
                 intentId: event.intentId,
-                stepId: event.stepId,
-                index: event.index,
+                stepId: String(event.stepId || '').trim() || null,
+                sourceNodeId: null,
+                ...(Number.isSafeInteger(event.index) ? { index: event.index } : {}),
                 logicalExecutionId,
                 attempt,
                 state,
@@ -246,9 +267,14 @@ class EventBus {
             const incomplete = [...this.activeLifecycle.entries()]
                 .filter(([, position]) => position.runId === event.runId);
             for (const [logicalExecutionId, position] of incomplete) {
-                this.emitStepLifecycle({
+                this.emitQualifiedStepLifecycle({
+                    type: STEP_LIFECYCLE_EVENT_TYPE,
+                    eventType: STEP_LIFECYCLE_EVENT_TYPE,
+                    eventVersion: STEP_LIFECYCLE_EVENT_VERSION,
                     ...position,
                     logicalExecutionId,
+                    stepId: position.stepId || null,
+                    sourceNodeId: null,
                     state: 'unknown',
                     timestamp: event.timestamp
                 });
@@ -259,6 +285,7 @@ class EventBus {
                 this.activeLifecycle.delete(logicalExecutionId);
             }
             this.lifecycleIdsByRun.delete(event.runId);
+            this.openRuns.delete(event.runId);
             this.closedRuns.set(event.runId, true);
             while (this.closedRuns.size > EventBus.CLOSED_RUN_RETENTION) {
                 const oldest = this.closedRuns.keys().next().value as string | undefined;

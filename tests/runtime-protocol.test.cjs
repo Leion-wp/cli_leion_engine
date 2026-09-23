@@ -4,7 +4,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 const { workspace, step } = require('./runtime-fixture.cjs');
-const { getRuntimeCapabilities, describeRuntime, PROTOCOL_COMMANDS } = require('../packages/core/out/runtimeCatalog');
+const { getRuntimeCapabilities, describeRuntime, PROTOCOL_COMMANDS, PROTOCOL_VERSION } = require('../packages/core/out/runtimeCatalog');
 const { validatePipelineData } = require('../packages/core/out/validatePipeline');
 const { resolvePipelineSourcePath } = require('../packages/core/out/pipelineSource');
 const registry = require('../packages/core/out/registry');
@@ -77,6 +77,7 @@ test('catalog preserves shared registration descriptors and exposes conservative
   catalog.find((entry) => entry.capability === 'terminal.run').args[0].required = false;
   assert.equal(getRuntimeCapabilities().find((entry) => entry.capability === 'terminal.run').args[0].required, true);
   const envelope = describeRuntime('fixture-version');
+  assert.equal(PROTOCOL_VERSION, '1');
   assert.equal(envelope.runtime.version, 'fixture-version');
   assert.deepEqual(envelope.runtime.capabilities, PROTOCOL_COMMANDS);
   assert.deepEqual(envelope.runtime.contracts.pipeline_inputs, {

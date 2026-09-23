@@ -297,6 +297,7 @@ async function main(): Promise<void> {
                 detachedRunId: state.detachedRunId,
                 logicalExecutionId: stableLogicalExecutionId(
                     state.detachedRunId,
+                    eventRunId || args.runId,
                     lifecycle.logicalExecutionId
                 ),
                 attempt: lifecycle.attempt,

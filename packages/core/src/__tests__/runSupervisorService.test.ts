@@ -8,7 +8,9 @@ import { createHash } from 'crypto';
 import { pipelineEventBus } from '../eventBus';
 import {
     STEP_LIFECYCLE_CONTRACT,
-    StepLifecycleMachine
+    StepLifecycleMachine,
+    runtimeLogicalExecutionId,
+    stableLogicalExecutionId
 } from '../stepLifecycleContract';
 import {
     RUN_LOG_MAX_LIMIT,
@@ -80,6 +82,7 @@ test('legacy step events derive one canonical lifecycle and explicit retry attem
     const runId = `runtime_${Date.now()}_legacy`;
     const intentId = 'intent_retry';
     const events: any[] = [];
+    pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 99 });
     const subscription = pipelineEventBus.on((event) => events.push(event));
     try {
         pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'compile', index: 3, timestamp: 100 });
@@ -105,6 +108,8 @@ test('pipeline end closes an incomplete execution as one terminal unknown', () =
     const otherRunId = `${runId}_other`;
     const intentId = 'intent_incomplete';
     const events: any[] = [];
+    pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 198 });
+    pipelineEventBus.emit({ type: 'pipelineStart', runId: otherRunId, timestamp: 199 });
     const subscription = pipelineEventBus.on((event) => events.push(event));
     try {
         pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'incomplete', timestamp: 200 });
@@ -138,6 +143,7 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
         const runId = `${prefix}_${index}`;
         if (index === 0) firstRunId = runId;
         retainedRunId = runId;
+        pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 299 + index });
         pipelineEventBus.emit({
             type: 'stepStart',
             runId,
@@ -160,19 +166,43 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
     assert.equal(bus.lifecycle.positions.size, 0);
     assert.equal(bus.activeLifecycle.size, 0);
     assert.equal(bus.lifecycleIdsByRun.size, 0);
+    assert.equal(bus.openRuns.size, 0);
 
     const isolatedRunId = `${prefix}_isolated`;
     const lifecycleEvents: any[] = [];
+    const observedEvents: any[] = [];
     const subscription = pipelineEventBus.on((event) => {
+        observedEvents.push(event);
         if (event.type === 'step_lifecycle') lifecycleEvents.push(event);
     });
     try {
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: retainedRunId, timestamp: 1998 });
+        assert.equal(bus.openRuns.has(retainedRunId), false);
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: firstRunId,
+            intentId: 'intent_evicted_late',
+            stepId: 'step_evicted_late',
+            attempt: 1,
+            state: 'running',
+            timestamp: 1999
+        }), false);
+        pipelineEventBus.emit({
+            type: 'stepStart', runId: firstRunId, intentId: 'legacy_evicted_late',
+            stepId: 'legacy_evicted_late', timestamp: 1999
+        });
+        pipelineEventBus.emit({
+            type: 'stepStart', runId: retainedRunId, intentId: 'legacy_retained_late',
+            stepId: 'legacy_retained_late', timestamp: 1999
+        });
+        assert.equal(observedEvents.some((event) => event.runId === firstRunId), false);
+        assert.equal(observedEvents.filter((event) => event.runId === retainedRunId).length, 1);
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000 });
         pipelineEventBus.emit({
             type: 'stepStart',
             runId: isolatedRunId,
             intentId: 'intent_isolated',
             stepId: 'step_isolated',
-            timestamp: 2000
+            timestamp: 2001
         });
         assert.equal(pipelineEventBus.emitStepLifecycle({
             runId: retainedRunId,
@@ -180,7 +210,7 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
             stepId: 'step_late',
             attempt: 1,
             state: 'running',
-            timestamp: 2001
+            timestamp: 2002
         }), false);
         assert.deepEqual(
             lifecycleEvents.map((event) => [event.runId, event.state]),
@@ -189,10 +219,11 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
         assert.equal(bus.lifecycle.positions.size, 1);
         assert.equal(bus.activeLifecycle.size, 1);
         assert.equal(bus.lifecycleIdsByRun.size, 1);
+        assert.equal(bus.openRuns.size, 1);
         pipelineEventBus.emit({
             type: 'pipelineEnd',
             runId: isolatedRunId,
-            timestamp: 2002,
+            timestamp: 2003,
             success: true,
             status: 'success'
         });
@@ -204,6 +235,51 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
     assert.equal(bus.lifecycle.positions.size, 0);
     assert.equal(bus.activeLifecycle.size, 0);
     assert.equal(bus.lifecycleIdsByRun.size, 0);
+    assert.equal(bus.openRuns.size, 0);
+});
+
+test('the same explicit logical key is isolated by runtime run id', () => {
+    const prefix = `runtime_${Date.now()}_shared_key`;
+    const runIds = [`${prefix}_a`, `${prefix}_b`];
+    const lifecycle: any[] = [];
+    const subscription = pipelineEventBus.on((event) => {
+        if (event.type === 'step_lifecycle') lifecycle.push(event);
+    });
+    try {
+        for (const runId of runIds) {
+            pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 3000 });
+            pipelineEventBus.emit({
+                type: 'stepStart', runId, intentId: 'shared', stepId: 'shared',
+                logicalExecutionId: 'same-explicit-key', timestamp: 3001
+            });
+        }
+        pipelineEventBus.emit({
+            type: 'stepEnd', runId: runIds[0], intentId: 'shared', stepId: 'shared',
+            logicalExecutionId: 'same-explicit-key', timestamp: 3002, success: true
+        });
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: runIds[1], intentId: 'shared', stepId: 'shared',
+            logicalExecutionId: 'same-explicit-key', attempt: 1, state: 'retrying', timestamp: 3003
+        }), true);
+    } finally {
+        for (const runId of runIds) {
+            pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 3004, success: true, status: 'success' });
+        }
+        subscription.dispose();
+    }
+    const identities = lifecycle
+        .filter((event) => event.state === 'running')
+        .map((event) => event.logicalExecutionId);
+    assert.equal(identities.length, 2);
+    assert.notEqual(identities[0], identities[1]);
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runIds[0]).map((event) => event.state),
+        ['running', 'succeeded']
+    );
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runIds[1]).map((event) => event.state),
+        ['running', 'retrying', 'unknown']
+    );
 });
 
 test('an unattributed or incomplete lifecycle projects explicit nulls and terminal unknown', () => {
@@ -1926,6 +2002,14 @@ test('worker attributes lifecycle only from verified approved bundle facts', (t)
     assert.equal(new Set(rootLifecycle.map((event) => event.logical_execution_id)).size, 1);
     assert.equal(new Set(childLifecycle.map((event) => event.logical_execution_id)).size, 1);
     assert.notEqual(rootLifecycle[0].logical_execution_id, childLifecycle[0].logical_execution_id);
+    assert.equal(
+        rootLifecycle[0].logical_execution_id,
+        stableLogicalExecutionId(
+            detachedRunId,
+            runtimeRunId,
+            runtimeLogicalExecutionId(runtimeRunId, 'derived', 'intent-7', 'compile-step', 0)
+        )
+    );
     for (const event of rootLifecycle) {
         assert.equal(event.event_type, 'step_lifecycle');
         assert.equal(event.event_version, 1);
@@ -1987,6 +2071,127 @@ test('worker attributes lifecycle only from verified approved bundle facts', (t)
     assert.ok(authorLifecycle.every((event) => event.plan_id === null));
     assert.ok(authorLifecycle.every((event) => event.pipeline_hash === authorHash));
     assert.ok(authorLifecycle.every((event) => event.pipeline_path === canonicalAuthorPath));
+    assert.notEqual(authorLifecycle[0].logical_execution_id, rootLifecycle[0].logical_execution_id);
+});
+
+test('tail_events validates raw lifecycle identity, timestamps, and verified root provenance', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_projection_guard';
+    const runtimeRunId = 'runtime_lifecycle_projection_guard';
+    const planId = 'plan_projection_guard';
+    const pipeline = {
+        name: 'projection-guard',
+        steps: [{
+            id: 'guard-step',
+            intent: 'system.setVar',
+            payload: { name: 'guard', value: 'ok' },
+            meta: { sourceNodeId: 'source-guard' }
+        }]
+    };
+    const serialized = JSON.stringify(pipeline);
+    const pipelineHash = createHash('sha256').update(serialized).digest('hex');
+    const bundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', planId);
+    fs.mkdirSync(bundleDirectory, { recursive: true });
+    const pipelinePath = path.join(bundleDirectory, `${pipelineHash}.intent.json`);
+    fs.writeFileSync(pipelinePath, serialized, 'utf8');
+    const state: DetachedRunState = {
+        detachedRunId,
+        correlationId: 'projection-guard',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: pipelinePath,
+        pipelinePath: fs.realpathSync.native(pipelinePath),
+        pipelineHash,
+        planId,
+        pipelineRunId: runtimeRunId,
+        dryRun: true,
+        status: 'success',
+        startedAt: 1000,
+        updatedAt: 2000,
+        endedAt: 2000
+    };
+    writeJsonFile(stateFilePath(workspace, detachedRunId), state);
+    const eventPath = eventsFilePath(workspace, detachedRunId);
+    const basePayload = {
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId,
+        detachedRunId,
+        logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-logical'),
+        attempt: 1,
+        stepId: 'guard-step',
+        sourceNodeId: 'source-guard',
+        pipelineHash,
+        pipelinePath: state.pipelinePath,
+        planId,
+        state: 'succeeded',
+        originTimestamp: 1000,
+        persistedTimestamp: 2000
+    };
+    const divergences = [
+        {},
+        { runtimeRunId: 'runtime_spoofed' },
+        { detachedRunId: 'run_spoofed' },
+        { persistedTimestamp: 2001 },
+        { pipelineHash: 'f'.repeat(64) },
+        { sourceNodeId: 'source-spoofed' }
+    ];
+    divergences.forEach((patch, index) => appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000,
+        runId: runtimeRunId,
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, `guard-${index}`),
+            ...patch
+        }
+    }));
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000.5,
+        runId: runtimeRunId,
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-fractional-ts'),
+            persistedTimestamp: 2000.5
+        }
+    });
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000,
+        runId: 'runtime invalid',
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-invalid-record-run')
+        }
+    });
+
+    const lifecycle = new RunSupervisorService(workspace)
+        .tail_events('projection-guard', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(lifecycle.length, divergences.length + 2);
+    assert.equal(lifecycle[0].state, 'succeeded');
+    assert.equal(lifecycle[0].source_node_id, 'source-guard');
+    assert.equal(lifecycle[0].pipeline_hash, pipelineHash);
+    for (const event of lifecycle.slice(1)) {
+        assert.equal(event.state, 'unknown');
+        assert.equal(event.source_node_id, null);
+        assert.equal(event.pipeline_hash, null);
+        assert.equal(event.pipeline_path, null);
+        assert.equal(event.plan_id, null);
+    }
+
+    fs.writeFileSync(pipelinePath, '{"changed":true}', 'utf8');
+    const degraded = new RunSupervisorService(workspace)
+        .tail_events('projection-guard', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(degraded.length, lifecycle.length);
+    assert.ok(degraded.every((event) => event.state === 'unknown'));
+    assert.ok(degraded.every((event) => event.source_node_id === null));
+    assert.ok(degraded.every((event) => event.pipeline_hash === null));
 });
 
 test('lifecycle cursor replay preserves identities, null attribution, and timestamps', (t) => {

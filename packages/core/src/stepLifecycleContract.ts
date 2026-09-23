@@ -106,6 +106,13 @@ export function stableLogicalExecutionId(...parts: Array<string | number | null 
     return `step_${createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
 }
 
+export function runtimeLogicalExecutionId(
+    runtimeRunId: string,
+    ...logicalParts: Array<string | number | null | undefined>
+): string {
+    return stableLogicalExecutionId(runtimeRunId, ...logicalParts);
+}
+
 export function stepLifecycleTransitionAllowed(
     previous: StepLifecycleState | undefined,
     next: StepLifecycleState
