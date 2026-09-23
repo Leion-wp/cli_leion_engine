@@ -61,13 +61,18 @@ test('step lifecycle contract is closed and terminal executions never transition
         scope: {
             opensOn: 'pipelineStart',
             closesOn: 'pipelineEnd',
+            duplicatePipelineStart: 'rejected_without_dispatch',
             lifecycleOutsideOpenRun: 'rejected',
             legacyCompatibilityOutsideOpenRun: 'dispatched'
         },
         closedRunRetention: {
             strategy: 'fifo',
             max: 1024,
-            duplicatePipelineStart: 'rejected_while_retained'
+            duplicatePipelineStart: 'rejected_without_dispatch_while_retained'
+        },
+        persistence: {
+            canonicalLifecycle: 'required',
+            auxiliaryEvents: 'best_effort'
         },
         terminalTransitions: 'forbidden',
         retryAttempt: 'increment_on_running',
@@ -211,7 +216,7 @@ test('pipeline end closes an incomplete execution as one terminal unknown', () =
     assert.equal(events.filter((event) => event.type === 'stepEnd').length, 2);
 });
 
-test('pipeline end bounds tombstones and releases lifecycle tracking without cross-run contamination', () => {
+test('pipeline start duplicates are rejected without listener dispatch and tombstones remain bounded', () => {
     const bus = pipelineEventBus as any;
     const prefix = `runtime_${Date.now()}_retention_${Math.random().toString(36).slice(2)}`;
     let firstRunId = '';
@@ -278,9 +283,10 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
         );
         assert.deepEqual(
             observedEvents.filter((event) => event.runId === retainedRunId).map((event) => event.type),
-            ['pipelineStart', 'stepStart']
+            ['stepStart']
         );
         pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000 });
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000.5 });
         pipelineEventBus.emit({
             type: 'stepStart',
             runId: isolatedRunId,
@@ -299,6 +305,10 @@ test('pipeline end bounds tombstones and releases lifecycle tracking without cro
         assert.deepEqual(
             lifecycleEvents.map((event) => [event.runId, event.state]),
             [[isolatedRunId, 'running']]
+        );
+        assert.equal(
+            observedEvents.filter((event) => event.type === 'pipelineStart' && event.runId === isolatedRunId).length,
+            1
         );
         assert.equal(bus.lifecycle.positions.size, 1);
         assert.equal(bus.activeLifecycle.size, 1);
@@ -1660,7 +1670,7 @@ test('worker keeps root run state nonterminal across nested pipeline events', (t
     assert.equal(completed.result.runId, 'root-runtime');
 });
 
-test('event journal failure cannot change successful execution or terminal state', (t) => {
+test('auxiliary event journal failure cannot change successful execution or terminal state', (t) => {
     const workspace = createWorkspace();
     t.after(() => removeWorkspace(workspace));
     const runId = 'run_event_failure';
@@ -1690,7 +1700,7 @@ test('event journal failure cannot change successful execution or terminal state
         `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
         `  async run_pipeline_data() {`,
         `    bus.emit({ type: 'pipelineStart', runId: 'root-event-failure', timestamp: Date.now() });`,
-        `    bus.emit({ type: 'stepEnd', runId: 'root-event-failure', intentId: 'step', stepId: 'step', timestamp: Date.now(), success: true });`,
+        `    bus.emit({ type: 'stepLog', runId: 'root-event-failure', intentId: 'step', stepId: 'step', text: 'auxiliary', stream: 'stdout' });`,
         `    bus.emit({ type: 'pipelineEnd', runId: 'root-event-failure', timestamp: Date.now(), success: true, status: 'success' });`,
         `    return { runId: 'root-event-failure', success: true, status: 'success' };`,
         `  }`,
@@ -1713,6 +1723,62 @@ test('event journal failure cannot change successful execution or terminal state
     const completed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     assert.equal(completed.status, 'success');
     assert.equal(completed.result.runId, 'root-event-failure');
+});
+
+test('worker fails closed when canonical lifecycle persistence is unavailable', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const runId = 'run_lifecycle_persist_failure';
+    const pipelinePath = path.join(workspace, 'pipeline', 'demo.intent.json');
+    fs.writeFileSync(pipelinePath, JSON.stringify({
+        name: 'lifecycle-persist-failure',
+        steps: [{
+            id: 'required-lifecycle',
+            intent: 'system.setVar',
+            payload: { name: 'result', value: 'must-not-succeed' }
+        }]
+    }), 'utf8');
+    const canonicalPipelinePath = fs.realpathSync.native(pipelinePath);
+    const pipelineHash = createHash('sha256').update(fs.readFileSync(canonicalPipelinePath)).digest('hex');
+    const state: DetachedRunState = {
+        detachedRunId: runId,
+        correlationId: 'lifecycle-persist-failure',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: 'demo',
+        pipelinePath: canonicalPipelinePath,
+        pipelineHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    const statePath = stateFilePath(workspace, runId);
+    const eventPath = eventsFilePath(workspace, runId);
+    writeJsonFile(statePath, state);
+    // A directory at the journal path fails appendFileSync consistently on Windows
+    // without depending on ACL semantics or elevated process permissions.
+    fs.mkdirSync(eventPath, { recursive: true });
+
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const result = cp.spawnSync(process.execPath, [
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', runId,
+        '--pipeline', 'demo',
+        '--pipeline_path', canonicalPipelinePath,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stderr.includes(eventPath), false);
+    assert.equal(result.stderr.includes('EISDIR'), false);
+    const completed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(completed.status, 'failure');
+    assert.equal(completed.errorCode, 'RUN_LIFECYCLE_PERSIST_FAILED');
+    assert.equal(completed.error, 'Canonical step lifecycle event could not be persisted.');
+    assert.equal(completed.result, undefined);
+    assert.deepEqual(fs.readdirSync(eventPath), []);
 });
 
 test('worker publishes a sanitized error event before catch makes state terminal', (t) => {
@@ -2003,6 +2069,13 @@ test('event journal uses an allowlist and persists only hashes for log text', (t
     }), { runId: 'runtime-1', success: true, status: 'success' });
     const safeError = sanitizeWorkerError(Object.assign(new Error('exception-secret-value'), { code: 'UPSTREAM_FAILED' }));
     assert.deepEqual(safeError, { code: 'RUN_WORKER_FAILED', message: 'Detached worker failed.' });
+    assert.deepEqual(
+        sanitizeWorkerError(Object.assign(new Error('journal-secret-value'), { code: 'RUN_LIFECYCLE_PERSIST_FAILED' })),
+        {
+            code: 'RUN_LIFECYCLE_PERSIST_FAILED',
+            message: 'Canonical step lifecycle event could not be persisted.'
+        }
+    );
     assert.equal(JSON.stringify(safeError).includes('exception-secret-value'), false);
 });
 

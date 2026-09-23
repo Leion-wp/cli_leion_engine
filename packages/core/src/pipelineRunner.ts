@@ -874,6 +874,7 @@ async function runPipeline(
                         let failureCount = 0;
                         let truncated = false;
                         let lastErrorMessage = '';
+                        graphCycles:
                         for (let cycleIndex = 0; cycleIndex < repeatCount; cycleIndex += 1) {
                             for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
                                 if ((Date.now() - loopStartTs) > maxDurationCfg) {
@@ -889,6 +890,8 @@ async function runPipeline(
                                 variableCache.set('loop_cycle', String(cycleIndex));
 
                                 for (const graphStepId of graphStepIds) {
+                                    while (isPaused && !isCancelled) await sleep(100);
+                                    if (isCancelled) break graphCycles;
                                     const projectedOps = (processedItems * Math.max(1, graphStepIds.length)) + 1;
                                     if (projectedOps > maxTotalOpsCfg) {
                                         throw new Error(`Loop maxTotalOps exceeded (${maxTotalOpsCfg}).`);
@@ -920,11 +923,14 @@ async function runPipeline(
                                         text: `[loop] iter=${globalIndex + 1} cycle=${cycleIndex + 1} item="${String(items[itemIndex])}" step=${graphStepId}`,
                                         stream: 'stdout'
                                     } as any);
+                                    lastErrorMessage = '';
                                     let childResult: any = false;
                                     let interactionError: any;
+                                    let finalTargetAttempt = 1;
                                     try {
                                         const compiledTarget = await compileStep(targetStep, variableCache, currentCwd, trustedRoot);
                                         const sandboxPolicy = resolveRuntimeSandboxPolicy(compiledTarget);
+                                        const retryPolicy = resolveRetryPolicy(compiledTarget);
                                         const sandboxError = checkRuntimeSandbox(compiledTarget, sandboxPolicy, sandboxUsage);
                                         if (sandboxError) {
                                             throw new Error(`[sandbox] ${sandboxError}`);
@@ -932,29 +938,100 @@ async function runPipeline(
                                         if (detectIntentUsesNetwork(compiledTarget)) sandboxUsage.networkOps += 1;
                                         if (detectIntentWritesFiles(compiledTarget)) sandboxUsage.fileWrites += 1;
 
-                                        childResult = await Promise.race([
-                                            routeIntent(
-                                                {
-                                                    ...compiledTarget,
-                                                    meta: {
-                                                        ...(compiledTarget.meta || {}),
-                                                        dryRun: step.meta?.dryRun === true || compiledTarget.meta?.dryRun === true,
-                                                        traceId: targetIntentId,
-                                                        runId,
-                                                        stepId: compiledTarget.id,
-                                                        cwd: currentCwd,
-                                                        subPipelineDepth: subPipelineDepth + 1
-                                                    }
-                                                },
-                                                variableCache
-                                            ),
-                                            new Promise<any>((_, reject) => {
-                                                const handle = setTimeout(() => {
-                                                    clearTimeout(handle);
-                                                    reject(new Error(`Step timed out after ${sandboxPolicy.timeoutMs}ms.`));
-                                                }, sandboxPolicy.timeoutMs);
-                                            })
-                                        ]);
+                                        for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt += 1) {
+                                            while (isPaused && !isCancelled) await sleep(100);
+                                            if (isCancelled) break;
+                                            finalTargetAttempt = attempt;
+                                            if (attempt > 1) {
+                                                pipelineEventBus.emitStepLifecycle({
+                                                    runId,
+                                                    intentId: targetIntentId,
+                                                    logicalExecutionId: targetLogicalExecutionId,
+                                                    stepId: targetStep.id,
+                                                    index: targetStepIndex,
+                                                    attempt,
+                                                    state: 'running',
+                                                    timestamp: Date.now()
+                                                });
+                                            }
+
+                                            let timeoutHandle: NodeJS.Timeout | undefined;
+                                            try {
+                                                childResult = await Promise.race([
+                                                    routeIntent(
+                                                        {
+                                                            ...compiledTarget,
+                                                            meta: {
+                                                                ...(compiledTarget.meta || {}),
+                                                                dryRun: step.meta?.dryRun === true || compiledTarget.meta?.dryRun === true,
+                                                                traceId: targetIntentId,
+                                                                runId,
+                                                                stepId: compiledTarget.id,
+                                                                cwd: currentCwd,
+                                                                subPipelineDepth: subPipelineDepth + 1
+                                                            }
+                                                        },
+                                                        variableCache
+                                                    ),
+                                                    new Promise<any>((_, reject) => {
+                                                        timeoutHandle = setTimeout(() => {
+                                                            reject(new Error(`Step timed out after ${sandboxPolicy.timeoutMs}ms.`));
+                                                        }, sandboxPolicy.timeoutMs);
+                                                    })
+                                                ]);
+                                            } catch (error: any) {
+                                                if (isInteractionRequired(error)) {
+                                                    interactionError = error;
+                                                    childResult = false;
+                                                    break;
+                                                }
+                                                if (isCancelled) {
+                                                    childResult = false;
+                                                    lastErrorMessage = '';
+                                                    break;
+                                                }
+                                                lastErrorMessage = String(error?.message || error || 'Unknown loop graph_segment error');
+                                                childResult = false;
+                                            } finally {
+                                                if (timeoutHandle) clearTimeout(timeoutHandle);
+                                            }
+
+                                            if (isCancelled) {
+                                                childResult = false;
+                                                lastErrorMessage = '';
+                                                break;
+                                            }
+                                            const attemptOk = typeof childResult === 'boolean'
+                                                ? childResult
+                                                : (childResult !== undefined && childResult !== null);
+                                            if (attemptOk || interactionError) break;
+                                            if (!lastErrorMessage) {
+                                                lastErrorMessage = `Step returned unsuccessful result for intent "${String(compiledTarget.intent || '')}".`;
+                                            }
+                                            if (attempt < retryPolicy.maxAttempts) {
+                                                const delayMs = computeRetryDelayMs(retryPolicy, attempt);
+                                                pipelineEventBus.emitStepLifecycle({
+                                                    runId,
+                                                    intentId: targetIntentId,
+                                                    logicalExecutionId: targetLogicalExecutionId,
+                                                    stepId: targetStep.id,
+                                                    index: targetStepIndex,
+                                                    attempt,
+                                                    state: 'retrying',
+                                                    timestamp: Date.now()
+                                                });
+                                                pipelineEventBus.emit({
+                                                    type: 'stepLog',
+                                                    runId,
+                                                    intentId: targetIntentId,
+                                                    stepId: targetStep.id,
+                                                    text: `[retry] attempt ${attempt}/${retryPolicy.maxAttempts} failed${lastErrorMessage ? `: ${lastErrorMessage}` : ''}${delayMs > 0 ? `; retry in ${delayMs}ms` : '; retry now'}`,
+                                                    stream: 'stderr'
+                                                } as any);
+                                                if (delayMs > 0) await sleep(delayMs);
+                                                if (isCancelled) break;
+                                            }
+                                        }
                                     } catch (error: any) {
                                         interactionError = isInteractionRequired(error) ? error : undefined;
                                         lastErrorMessage = String(error?.message || error || 'Unknown loop graph_segment error');
@@ -972,11 +1049,12 @@ async function runPipeline(
                                         timestamp: Date.now(),
                                         success: ok,
                                         lifecycleState: isCancelled ? 'cancelled' : (ok ? 'succeeded' : 'failed'),
-                                        attempt: 1,
+                                        attempt: finalTargetAttempt,
                                         index: targetStepIndex,
                                         stepId: targetStep.id
                                     });
                                     if (interactionError) throw interactionError;
+                                    if (isCancelled) break graphCycles;
                                     if (ok) {
                                         successCount += 1;
                                         continue;
@@ -990,6 +1068,14 @@ async function runPipeline(
                                 processedItems += 1;
                             }
                             if (truncated) break;
+                        }
+                        if (isCancelled) {
+                            pipelineEventBus.emit({
+                                type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false,
+                                lifecycleState: 'cancelled', index: currentIndex, stepId: step.id
+                            });
+                            runStatus = 'cancelled';
+                            break;
                         }
                         if (errorStrategy === 'fail_at_end' && failureCount > 0) {
                             throw new Error(`Loop completed with ${failureCount} failure(s) under fail_at_end strategy.`);
@@ -1438,6 +1524,7 @@ async function runPipeline(
             let lastErrorMessage = '';
             let finalAttempt = 1;
             for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
+                if (isCancelled) break;
                 finalAttempt = attempt;
                 if (attempt > 1) {
                     pipelineEventBus.emitStepLifecycle({
@@ -1492,6 +1579,13 @@ async function runPipeline(
                     if (timeoutHandle) clearTimeout(timeoutHandle);
                 }
 
+                if (isCancelled) {
+                    result = false;
+                    ok = false;
+                    lastErrorMessage = '';
+                    break;
+                }
+
                 if (attempt < retryPolicy.maxAttempts) {
                     const delayMs = computeRetryDelayMs(retryPolicy, attempt);
                     pipelineEventBus.emitStepLifecycle({
@@ -1512,6 +1606,7 @@ async function runPipeline(
                         stream: 'stderr'
                     } as any);
                     if (delayMs > 0) await sleep(delayMs);
+                    if (isCancelled) break;
                 }
             }
 

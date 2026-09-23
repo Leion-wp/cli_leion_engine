@@ -49,13 +49,18 @@ export const STEP_LIFECYCLE_CONTRACT = Object.freeze({
     scope: Object.freeze({
         opensOn: 'pipelineStart',
         closesOn: 'pipelineEnd',
+        duplicatePipelineStart: 'rejected_without_dispatch',
         lifecycleOutsideOpenRun: 'rejected',
         legacyCompatibilityOutsideOpenRun: 'dispatched'
     }),
     closedRunRetention: Object.freeze({
         strategy: 'fifo',
         max: 1024,
-        duplicatePipelineStart: 'rejected_while_retained'
+        duplicatePipelineStart: 'rejected_without_dispatch_while_retained'
+    }),
+    persistence: Object.freeze({
+        canonicalLifecycle: 'required',
+        auxiliaryEvents: 'best_effort'
     }),
     terminalTransitions: 'forbidden',
     retryAttempt: 'increment_on_running',

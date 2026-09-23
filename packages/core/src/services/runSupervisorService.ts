@@ -524,7 +524,12 @@ export function projectRunResult(value: any): { runId?: string; success: boolean
 
 export function sanitizeWorkerError(error: any): { code: string; message: string } {
     const rawCode = String(error?.code || '').trim();
-    const code = ['INTERACTION_REQUIRED', 'RUN_PIPELINE_CHANGED', 'RUN_PIPELINE_INVALID'].includes(rawCode)
+    const code = [
+        'INTERACTION_REQUIRED',
+        'RUN_PIPELINE_CHANGED',
+        'RUN_PIPELINE_INVALID',
+        'RUN_LIFECYCLE_PERSIST_FAILED'
+    ].includes(rawCode)
         ? rawCode
         : 'RUN_WORKER_FAILED';
     const message = code === 'INTERACTION_REQUIRED'
@@ -533,7 +538,9 @@ export function sanitizeWorkerError(error: any): { code: string; message: string
             ? 'Pipeline content changed before execution.'
             : code === 'RUN_PIPELINE_INVALID'
                 ? 'Pipeline content is not valid JSON.'
-                : 'Detached worker failed.';
+                : code === 'RUN_LIFECYCLE_PERSIST_FAILED'
+                    ? 'Canonical step lifecycle event could not be persisted.'
+                    : 'Detached worker failed.';
     return { code, message };
 }
 

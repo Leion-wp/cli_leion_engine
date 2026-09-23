@@ -125,13 +125,18 @@ test('catalog preserves shared registration descriptors and exposes conservative
     scope: {
       opensOn: 'pipelineStart',
       closesOn: 'pipelineEnd',
+      duplicatePipelineStart: 'rejected_without_dispatch',
       lifecycleOutsideOpenRun: 'rejected',
       legacyCompatibilityOutsideOpenRun: 'dispatched'
     },
     closedRunRetention: {
       strategy: 'fifo',
       max: 1024,
-      duplicatePipelineStart: 'rejected_while_retained'
+      duplicatePipelineStart: 'rejected_without_dispatch_while_retained'
+    },
+    persistence: {
+      canonicalLifecycle: 'required',
+      auxiliaryEvents: 'best_effort'
     },
     terminalTransitions: 'forbidden',
     retryAttempt: 'increment_on_running',

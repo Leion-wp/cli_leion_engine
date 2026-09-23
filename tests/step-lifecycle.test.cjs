@@ -67,6 +67,30 @@ test('runner retry emits one legacy pair and one canonical attempt sequence', as
   assert.equal(new Set(facts.map((event) => event.logicalExecutionId)).size, 1);
 });
 
+test('standard retry stops immediately when a failed attempt cancels the run', async (t) => {
+  const f = fixture(t);
+  shim.setConfigEntries({ 'intentRouter.runtime.sandbox.timeoutMs': 60_000 });
+  let calls = 0;
+  t.mock.method(router, 'routeIntent', async () => {
+    calls += 1;
+    runner.cancelCurrentPipeline();
+    return false;
+  });
+
+  const result = await runner.runPipelineFromData({
+    name: 'cancel-during-standard-retry',
+    steps: [step('cancel-retry', 'sentinel.retry', {}, {
+      retry: { mode: 'fixed', maxAttempts: 2, delayMs: 1 }
+    })]
+  }, false);
+
+  assert.equal(result.status, 'cancelled');
+  assert.equal(calls, 1);
+  assert.deepEqual(lifecycle(f.events, result.runId, 'cancel-retry').map((event) => [event.state, event.attempt]), [
+    ['running', 1], ['cancelled', 1]
+  ]);
+});
+
 test('runner emits skipped dry-run and blocked branch terminals', async (t) => {
   const f = fixture(t);
   const result = await runner.runPipelineFromData({
@@ -159,4 +183,105 @@ test('graph segment targets emit distinct running and terminal facts before loop
   const loopTerminalIndex = failureEvents.findIndex((event) => event.type === 'step_lifecycle' && event.stepId === 'loop-fail' && event.state === 'failed');
   const targetTerminalIndex = failureEvents.findIndex((event) => event.type === 'step_lifecycle' && event.stepId === 'target-fail' && event.state === 'failed');
   assert.ok(targetTerminalIndex >= 0 && targetTerminalIndex < loopTerminalIndex);
+});
+
+test('graph segment pause checkpoint blocks the next target until resume', async (t) => {
+  const f = fixture(t);
+  let calls = 0;
+  let resolveFirstTarget;
+  const firstTarget = new Promise((resolve) => { resolveFirstTarget = resolve; });
+  t.after(() => runner.resumeCurrentPipeline());
+  t.mock.method(router, 'routeIntent', async () => {
+    calls += 1;
+    if (calls === 1) {
+      runner.pauseCurrentPipeline();
+      resolveFirstTarget();
+    }
+    return true;
+  });
+
+  const pending = runner.runPipelineFromData({
+    name: 'graph-pause-checkpoint',
+    steps: [
+      step('loop-pause', 'system.loop', {
+        executionMode: 'graph_segment', items: ['a', 'b'], graphStepIds: ['target-pause'], doneStepId: 'done-pause'
+      }),
+      step('target-pause', 'sentinel.graph'),
+      step('done-pause', 'system.setVar', { name: 'done', value: 'yes' })
+    ]
+  }, false);
+
+  await firstTarget;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(calls, 1);
+  runner.resumeCurrentPipeline();
+  const result = await pending;
+  assert.equal(result.status, 'success');
+  assert.equal(calls, 2);
+  assert.deepEqual(lifecycle(f.events, result.runId, 'target-pause').map((event) => event.state), [
+    'running', 'succeeded', 'running', 'succeeded'
+  ]);
+});
+
+test('graph segment cancellation after the first target prevents every following target', async (t) => {
+  const f = fixture(t);
+  let calls = 0;
+  t.mock.method(router, 'routeIntent', async () => {
+    calls += 1;
+    runner.cancelCurrentPipeline();
+    return false;
+  });
+
+  const result = await runner.runPipelineFromData({
+    name: 'graph-cancel-checkpoint',
+    steps: [
+      step('loop-cancel', 'system.loop', {
+        executionMode: 'graph_segment', items: ['a', 'b'], graphStepIds: ['target-cancel'], doneStepId: 'done-cancel'
+      }),
+      step('target-cancel', 'sentinel.graph', {}, {
+        retry: { mode: 'fixed', maxAttempts: 2, delayMs: 1 }
+      }),
+      step('done-cancel', 'system.setVar', { name: 'done', value: 'yes' })
+    ]
+  }, false);
+
+  assert.equal(result.status, 'cancelled');
+  assert.equal(calls, 1);
+  assert.deepEqual(lifecycle(f.events, result.runId, 'target-cancel').map((event) => event.state), ['running', 'cancelled']);
+  assert.deepEqual(lifecycle(f.events, result.runId, 'loop-cancel').map((event) => event.state), ['running', 'cancelled']);
+  const pipelineEnd = f.events.find((event) => event.type === 'pipelineEnd' && event.runId === result.runId);
+  assert.equal(pipelineEnd?.status, 'cancelled');
+});
+
+test('graph segment retries a target with canonical attempts and clears attempt timeouts', async (t) => {
+  const f = fixture(t);
+  shim.setConfigEntries({ 'intentRouter.runtime.sandbox.timeoutMs': 60_000 });
+  const timeoutCountBefore = process.getActiveResourcesInfo().filter((type) => type === 'Timeout').length;
+  let calls = 0;
+  t.mock.method(router, 'routeIntent', async () => ++calls >= 2);
+
+  const result = await runner.runPipelineFromData({
+    name: 'graph-target-retry',
+    steps: [
+      step('loop-retry', 'system.loop', {
+        executionMode: 'graph_segment', items: ['a'], graphStepIds: ['target-retry'], doneStepId: 'done-retry'
+      }),
+      step('target-retry', 'sentinel.graph', {}, {
+        retry: { mode: 'fixed', maxAttempts: 2, delayMs: 1 }
+      }),
+      step('done-retry', 'system.setVar', { name: 'done', value: 'yes' })
+    ]
+  }, false);
+
+  assert.equal(result.status, 'success');
+  assert.equal(calls, 2);
+  const facts = lifecycle(f.events, result.runId, 'target-retry');
+  assert.deepEqual(facts.map((event) => [event.state, event.attempt]), [
+    ['running', 1], ['retrying', 1], ['running', 2], ['succeeded', 2]
+  ]);
+  const targetEnd = f.events.find((event) => event.type === 'stepEnd'
+    && event.runId === result.runId && event.stepId === 'target-retry');
+  assert.equal(targetEnd?.attempt, 2);
+  const timeoutCountAfter = process.getActiveResourcesInfo().filter((type) => type === 'Timeout').length;
+  assert.equal(timeoutCountAfter, timeoutCountBefore);
 });

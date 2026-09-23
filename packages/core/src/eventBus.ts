@@ -197,7 +197,8 @@ class EventBus {
 
     emit(event: PipelineEvent): void {
         if (event.type === 'pipelineStart') {
-            if (!this.closedRuns.has(event.runId)) this.openRuns.add(event.runId);
+            if (this.openRuns.has(event.runId) || this.closedRuns.has(event.runId)) return;
+            this.openRuns.add(event.runId);
             this.dispatch(event);
             return;
         }

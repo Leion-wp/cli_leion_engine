@@ -237,7 +237,14 @@ async function main(): Promise<void> {
     );
     writeJsonFile(statePath, state);
 
-    const appendEvent = (type: string, payload: any, runIdOverride?: string, persistedAt = Date.now()) => {
+    let lifecyclePersistenceError: (Error & { code: string }) | undefined;
+    const appendEvent = (
+        type: string,
+        payload: any,
+        runIdOverride?: string,
+        persistedAt = Date.now(),
+        required = false
+    ) => {
         const eventRunId = String(runIdOverride || state.pipelineRunId || args.runId || '').trim() || args.runId;
         try {
             appendEventRecord(eventsPath, {
@@ -248,7 +255,14 @@ async function main(): Promise<void> {
                 payload
             });
         } catch {
-            // Observability must not alter pipeline execution or terminal state.
+            if (required) {
+                lifecyclePersistenceError ||= Object.assign(
+                    new Error('Canonical step lifecycle event could not be persisted.'),
+                    { code: 'RUN_LIFECYCLE_PERSIST_FAILED' }
+                );
+                throw lifecyclePersistenceError;
+            }
+            // Auxiliary observability must not alter pipeline execution or terminal state.
         }
     };
 
@@ -286,6 +300,7 @@ async function main(): Promise<void> {
     const subscription = pipelineEventBus.on((event: any) => {
         const eventRunId = String(event?.runId || '').trim() || undefined;
         if (event?.type === STEP_LIFECYCLE_EVENT_TYPE) {
+            if (lifecyclePersistenceError) throw lifecyclePersistenceError;
             const lifecycle = event as StepLifecycleEvent;
             const persistedAt = Date.now();
             const stepId = String(lifecycle.stepId || '').trim() || null;
@@ -309,7 +324,7 @@ async function main(): Promise<void> {
                 state: lifecycle.state,
                 originTimestamp: lifecycle.timestamp,
                 persistedTimestamp: persistedAt
-            }, eventRunId, persistedAt);
+            }, eventRunId, persistedAt, true);
         } else if (event?.type !== 'stepStart' && event?.type !== 'stepEnd') {
             appendEvent(String(event?.type || 'unknown'), event, eventRunId);
         }
@@ -520,6 +535,7 @@ async function main(): Promise<void> {
             dryRun: args.dryRun,
             from: args.from
         });
+        if (lifecyclePersistenceError) throw lifecyclePersistenceError;
         const nextStatus: RunStatus = result?.status === 'cancelled'
             ? 'cancelled'
             : (result?.success ? 'success' : 'failure');
@@ -541,7 +557,8 @@ async function main(): Promise<void> {
         });
         process.exitCode = finalStatus === 'success' ? 0 : 1;
     } catch (error: any) {
-        if (cancellationIsDurable()) {
+        const sanitizedError = sanitizeWorkerError(error);
+        if (sanitizedError.code !== 'RUN_LIFECYCLE_PERSIST_FAILED' && cancellationIsDurable()) {
             appendEvent('run.worker_finished', { status: 'cancelled', success: false }, state.pipelineRunId || args.runId);
             writeState({
                 status: 'cancelled',
@@ -559,7 +576,6 @@ async function main(): Promise<void> {
             process.exitCode = 1;
             return;
         }
-        const sanitizedError = sanitizeWorkerError(error);
         appendEvent('run.worker_error', { code: sanitizedError.code }, state.pipelineRunId || args.runId);
         writeState({
             status: 'failure',
