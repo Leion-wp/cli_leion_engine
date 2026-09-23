@@ -5,6 +5,13 @@ import * as os from 'os';
 import * as path from 'path';
 import * as cp from 'child_process';
 import { createHash } from 'crypto';
+import { pipelineEventBus } from '../eventBus';
+import {
+    STEP_LIFECYCLE_CONTRACT,
+    StepLifecycleMachine,
+    runtimeLogicalExecutionId,
+    stableLogicalExecutionId
+} from '../stepLifecycleContract';
 import {
     RUN_LOG_MAX_LIMIT,
     RUN_LOG_MAX_RECORD_BYTES,
@@ -23,10 +30,379 @@ import {
     executionClaimFilePath,
     stateFilePath,
     projectRunResult,
+    projectStepLifecyclePayload,
     sanitizeWorkerError,
     tryAcquireExecutionClaim,
     writeJsonFile
 } from '../services/runSupervisorService';
+
+test('step lifecycle contract is closed and terminal executions never transition again', () => {
+    assert.deepEqual(JSON.parse(JSON.stringify(STEP_LIFECYCLE_CONTRACT)), {
+        version: '1',
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        states: ['running', 'retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+        terminalStates: ['succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+        transitions: {
+            unknown: [],
+            running: ['retrying', 'succeeded', 'failed', 'cancelled', 'skipped', 'unknown'],
+            retrying: ['running', 'failed', 'cancelled', 'unknown'],
+            succeeded: [],
+            failed: [],
+            cancelled: [],
+            skipped: []
+        },
+        compatibilityEvents: { start: 'stepStart', end: 'stepEnd' },
+        runtimeRunId: {
+            uniqueness: 'required',
+            generator: 'time_plus_secure_random',
+            reuse: 'invalid'
+        },
+        scope: {
+            opensOn: 'pipelineStart',
+            closesOn: 'pipelineEnd',
+            duplicatePipelineStart: 'rejected_without_dispatch',
+            lifecycleOutsideOpenRun: 'rejected',
+            legacyCompatibilityOutsideOpenRun: 'dispatched'
+        },
+        closedRunRetention: {
+            strategy: 'fifo',
+            max: 1024,
+            duplicatePipelineStart: 'rejected_without_dispatch_while_retained'
+        },
+        persistence: {
+            canonicalLifecycle: 'required',
+            auxiliaryEvents: 'best_effort'
+        },
+        terminalTransitions: 'forbidden',
+        retryAttempt: 'increment_on_running',
+        incompleteTransition: 'unknown',
+        missingAttribution: 'null',
+        identityFields: [
+            'runtime_run_id', 'detached_run_id', 'logical_execution_id',
+            'attempt', 'step_id', 'source_node_id'
+        ],
+        provenanceFields: ['pipeline_hash', 'pipeline_path', 'plan_id'],
+        timestampFields: ['origin_timestamp', 'persisted_timestamp'],
+        cursor: { contract: 'run_logs', replay: 'stable_event_id_and_sequence' }
+    });
+
+    const machine = new StepLifecycleMachine();
+    const id = 'step_retry_machine';
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 1, state: 'running' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 1, state: 'retrying' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'running' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'succeeded' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: id, attempt: 2, state: 'failed' }), false);
+    const unknownId = 'step_unknown_terminal';
+    assert.equal(machine.accept({ logicalExecutionId: unknownId, attempt: 1, state: 'unknown' }), true);
+    assert.equal(machine.accept({ logicalExecutionId: unknownId, attempt: 1, state: 'running' }), false);
+});
+
+test('legacy step events derive one canonical lifecycle and explicit retry attempts', () => {
+    const runId = `runtime_${Date.now()}_legacy`;
+    const intentId = 'intent_retry';
+    const events: any[] = [];
+    pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 99 });
+    const subscription = pipelineEventBus.on((event) => events.push(event));
+    try {
+        pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'compile', index: 3, timestamp: 100 });
+        pipelineEventBus.emitStepLifecycle({ runId, intentId, stepId: 'compile', index: 3, attempt: 1, state: 'retrying', timestamp: 110 });
+        pipelineEventBus.emitStepLifecycle({ runId, intentId, stepId: 'compile', index: 3, attempt: 2, state: 'running', timestamp: 120 });
+        pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, stepId: 'compile', index: 3, attempt: 2, timestamp: 130, success: true });
+    } finally {
+        subscription.dispose();
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 131, success: true, status: 'success' });
+    }
+    assert.deepEqual(events.map((event) => event.type), [
+        'step_lifecycle', 'stepStart', 'step_lifecycle', 'step_lifecycle', 'step_lifecycle', 'stepEnd'
+    ]);
+    const lifecycle = events.filter((event) => event.type === 'step_lifecycle');
+    assert.deepEqual(lifecycle.map((event) => [event.state, event.attempt]), [
+        ['running', 1], ['retrying', 1], ['running', 2], ['succeeded', 2]
+    ]);
+    assert.equal(new Set(lifecycle.map((event) => event.logicalExecutionId)).size, 1);
+});
+
+test('legacy step events outside an open run remain observable without lifecycle derivation', () => {
+    const prefix = `runtime_${Date.now()}_legacy_scope_${Math.random().toString(36).slice(2)}`;
+    const unopenedRunId = `${prefix}_unopened`;
+    const closedRunId = `${prefix}_closed`;
+    pipelineEventBus.emit({ type: 'pipelineStart', runId: closedRunId, timestamp: 140 });
+    pipelineEventBus.emit({
+        type: 'pipelineEnd',
+        runId: closedRunId,
+        timestamp: 141,
+        success: true,
+        status: 'success'
+    });
+
+    const unopenedStart = {
+        type: 'stepStart' as const,
+        runId: unopenedRunId,
+        intentId: 'unopened-start',
+        stepId: 'unopened-step',
+        timestamp: 142
+    };
+    const unopenedEnd = {
+        type: 'stepEnd' as const,
+        runId: unopenedRunId,
+        intentId: 'unopened-end',
+        stepId: 'unopened-step',
+        timestamp: 143,
+        success: true
+    };
+    const closedStart = {
+        type: 'stepStart' as const,
+        runId: closedRunId,
+        intentId: 'closed-start',
+        stepId: 'closed-step',
+        timestamp: 144
+    };
+    const closedEnd = {
+        type: 'stepEnd' as const,
+        runId: closedRunId,
+        intentId: 'closed-end',
+        stepId: 'closed-step',
+        timestamp: 145,
+        success: false
+    };
+    const observed: any[] = [];
+    const subscription = pipelineEventBus.on((event) => observed.push(event));
+    try {
+        pipelineEventBus.emit(unopenedStart);
+        pipelineEventBus.emit(unopenedEnd);
+        pipelineEventBus.emit(closedStart);
+        pipelineEventBus.emit(closedEnd);
+    } finally {
+        subscription.dispose();
+    }
+
+    assert.deepEqual(observed.map((event) => event.type), ['stepStart', 'stepEnd', 'stepStart', 'stepEnd']);
+    assert.equal(observed.some((event) => event.type === 'step_lifecycle'), false);
+    assert.equal(observed[0], unopenedStart);
+    assert.equal(observed[1], unopenedEnd);
+    assert.equal(observed[2], closedStart);
+    assert.equal(observed[3], closedEnd);
+});
+
+test('pipeline end closes an incomplete execution as one terminal unknown', () => {
+    const runId = `runtime_${Date.now()}_incomplete`;
+    const otherRunId = `${runId}_other`;
+    const intentId = 'intent_incomplete';
+    const events: any[] = [];
+    pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 198 });
+    pipelineEventBus.emit({ type: 'pipelineStart', runId: otherRunId, timestamp: 199 });
+    const subscription = pipelineEventBus.on((event) => events.push(event));
+    try {
+        pipelineEventBus.emit({ type: 'stepStart', runId, intentId, stepId: 'incomplete', timestamp: 200 });
+        pipelineEventBus.emit({ type: 'stepStart', runId: otherRunId, intentId: 'intent_complete', stepId: 'complete', timestamp: 201 });
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 210, success: false, status: 'failure' });
+        pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, stepId: 'incomplete', timestamp: 220, success: true });
+        pipelineEventBus.emit({ type: 'stepEnd', runId: otherRunId, intentId: 'intent_complete', stepId: 'complete', timestamp: 221, success: true });
+        pipelineEventBus.emit({ type: 'pipelineEnd', runId: otherRunId, timestamp: 230, success: true, status: 'success' });
+    } finally {
+        subscription.dispose();
+    }
+    const lifecycle = events.filter((event) => event.type === 'step_lifecycle');
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runId).map((event) => event.state),
+        ['running', 'unknown']
+    );
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === otherRunId).map((event) => event.state),
+        ['running', 'succeeded']
+    );
+    assert.equal(events.filter((event) => event.type === 'stepEnd').length, 2);
+});
+
+test('pipeline start duplicates are rejected without listener dispatch and tombstones remain bounded', () => {
+    const bus = pipelineEventBus as any;
+    const prefix = `runtime_${Date.now()}_retention_${Math.random().toString(36).slice(2)}`;
+    let firstRunId = '';
+    let retainedRunId = '';
+
+    for (let index = 0; index < 1056; index++) {
+        const runId = `${prefix}_${index}`;
+        if (index === 0) firstRunId = runId;
+        retainedRunId = runId;
+        pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 299 + index });
+        pipelineEventBus.emit({
+            type: 'stepStart',
+            runId,
+            intentId: `intent_${index}`,
+            stepId: `step_${index}`,
+            timestamp: 300 + index
+        });
+        pipelineEventBus.emit({
+            type: 'pipelineEnd',
+            runId,
+            timestamp: 400 + index,
+            success: false,
+            status: 'failure'
+        });
+    }
+
+    assert.equal(bus.closedRuns.size, 1024);
+    assert.equal(bus.closedRuns.has(firstRunId), false);
+    assert.equal(bus.closedRuns.has(retainedRunId), true);
+    assert.equal(bus.lifecycle.positions.size, 0);
+    assert.equal(bus.activeLifecycle.size, 0);
+    assert.equal(bus.lifecycleIdsByRun.size, 0);
+    assert.equal(bus.openRuns.size, 0);
+
+    const isolatedRunId = `${prefix}_isolated`;
+    const lifecycleEvents: any[] = [];
+    const observedEvents: any[] = [];
+    const subscription = pipelineEventBus.on((event) => {
+        observedEvents.push(event);
+        if (event.type === 'step_lifecycle') lifecycleEvents.push(event);
+    });
+    try {
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: retainedRunId, timestamp: 1998 });
+        assert.equal(bus.openRuns.has(retainedRunId), false);
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: firstRunId,
+            intentId: 'intent_evicted_late',
+            stepId: 'step_evicted_late',
+            attempt: 1,
+            state: 'running',
+            timestamp: 1999
+        }), false);
+        pipelineEventBus.emit({
+            type: 'stepStart', runId: firstRunId, intentId: 'legacy_evicted_late',
+            stepId: 'legacy_evicted_late', timestamp: 1999
+        });
+        pipelineEventBus.emit({
+            type: 'stepStart', runId: retainedRunId, intentId: 'legacy_retained_late',
+            stepId: 'legacy_retained_late', timestamp: 1999
+        });
+        assert.deepEqual(
+            observedEvents.filter((event) => event.runId === firstRunId).map((event) => event.type),
+            ['stepStart']
+        );
+        assert.deepEqual(
+            observedEvents.filter((event) => event.runId === retainedRunId).map((event) => event.type),
+            ['stepStart']
+        );
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000 });
+        pipelineEventBus.emit({ type: 'pipelineStart', runId: isolatedRunId, timestamp: 2000.5 });
+        pipelineEventBus.emit({
+            type: 'stepStart',
+            runId: isolatedRunId,
+            intentId: 'intent_isolated',
+            stepId: 'step_isolated',
+            timestamp: 2001
+        });
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: retainedRunId,
+            intentId: 'intent_late',
+            stepId: 'step_late',
+            attempt: 1,
+            state: 'running',
+            timestamp: 2002
+        }), false);
+        assert.deepEqual(
+            lifecycleEvents.map((event) => [event.runId, event.state]),
+            [[isolatedRunId, 'running']]
+        );
+        assert.equal(
+            observedEvents.filter((event) => event.type === 'pipelineStart' && event.runId === isolatedRunId).length,
+            1
+        );
+        assert.equal(bus.lifecycle.positions.size, 1);
+        assert.equal(bus.activeLifecycle.size, 1);
+        assert.equal(bus.lifecycleIdsByRun.size, 1);
+        assert.equal(bus.openRuns.size, 1);
+        pipelineEventBus.emit({
+            type: 'pipelineEnd',
+            runId: isolatedRunId,
+            timestamp: 2003,
+            success: true,
+            status: 'success'
+        });
+    } finally {
+        subscription.dispose();
+    }
+
+    assert.equal(bus.closedRuns.size, 1024);
+    assert.equal(bus.lifecycle.positions.size, 0);
+    assert.equal(bus.activeLifecycle.size, 0);
+    assert.equal(bus.lifecycleIdsByRun.size, 0);
+    assert.equal(bus.openRuns.size, 0);
+});
+
+test('the same explicit logical key is isolated by runtime run id', () => {
+    const prefix = `runtime_${Date.now()}_shared_key`;
+    const runIds = [`${prefix}_a`, `${prefix}_b`];
+    const lifecycle: any[] = [];
+    const subscription = pipelineEventBus.on((event) => {
+        if (event.type === 'step_lifecycle') lifecycle.push(event);
+    });
+    try {
+        for (const runId of runIds) {
+            pipelineEventBus.emit({ type: 'pipelineStart', runId, timestamp: 3000 });
+            pipelineEventBus.emit({
+                type: 'stepStart', runId, intentId: 'shared', stepId: 'shared',
+                logicalExecutionId: 'same-explicit-key', timestamp: 3001
+            });
+        }
+        pipelineEventBus.emit({
+            type: 'stepEnd', runId: runIds[0], intentId: 'shared', stepId: 'shared',
+            logicalExecutionId: 'same-explicit-key', timestamp: 3002, success: true
+        });
+        assert.equal(pipelineEventBus.emitStepLifecycle({
+            runId: runIds[1], intentId: 'shared', stepId: 'shared',
+            logicalExecutionId: 'same-explicit-key', attempt: 1, state: 'retrying', timestamp: 3003
+        }), true);
+    } finally {
+        for (const runId of runIds) {
+            pipelineEventBus.emit({ type: 'pipelineEnd', runId, timestamp: 3004, success: true, status: 'success' });
+        }
+        subscription.dispose();
+    }
+    const identities = lifecycle
+        .filter((event) => event.state === 'running')
+        .map((event) => event.logicalExecutionId);
+    assert.equal(identities.length, 2);
+    assert.notEqual(identities[0], identities[1]);
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runIds[0]).map((event) => event.state),
+        ['running', 'succeeded']
+    );
+    assert.deepEqual(
+        lifecycle.filter((event) => event.runId === runIds[1]).map((event) => event.state),
+        ['running', 'retrying', 'unknown']
+    );
+});
+
+test('an unattributed or incomplete lifecycle projects explicit nulls and terminal unknown', () => {
+    const projected = projectStepLifecyclePayload({
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId: 'runtime_projection',
+        detachedRunId: 'run_projection',
+        logicalExecutionId: 'step_projection',
+        attempt: 0,
+        stepId: '',
+        sourceNodeId: 'invented node',
+        pipelineHash: 'not-a-hash',
+        pipelinePath: 'relative.intent.json',
+        planId: '../invented',
+        state: 'succeeded',
+        originTimestamp: 'invalid',
+        persistedTimestamp: 200
+    });
+    assert.equal(projected.state, 'unknown');
+    assert.equal(projected.attempt, 1);
+    assert.equal(projected.stepId, null);
+    assert.equal(projected.sourceNodeId, null);
+    assert.equal(projected.pipelineHash, null);
+    assert.equal(projected.pipelinePath, null);
+    assert.equal(projected.planId, null);
+    assert.equal(projected.originTimestamp, null);
+    assert.equal(projected.persistedTimestamp, 200);
+});
 
 function createWorkspace(): string {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'leion-correlation-'));
@@ -1294,7 +1670,7 @@ test('worker keeps root run state nonterminal across nested pipeline events', (t
     assert.equal(completed.result.runId, 'root-runtime');
 });
 
-test('event journal failure cannot change successful execution or terminal state', (t) => {
+test('auxiliary event journal failure cannot change successful execution or terminal state', (t) => {
     const workspace = createWorkspace();
     t.after(() => removeWorkspace(workspace));
     const runId = 'run_event_failure';
@@ -1324,7 +1700,7 @@ test('event journal failure cannot change successful execution or terminal state
         `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
         `  async run_pipeline_data() {`,
         `    bus.emit({ type: 'pipelineStart', runId: 'root-event-failure', timestamp: Date.now() });`,
-        `    bus.emit({ type: 'stepEnd', runId: 'root-event-failure', intentId: 'step', stepId: 'step', timestamp: Date.now(), success: true });`,
+        `    bus.emit({ type: 'stepLog', runId: 'root-event-failure', intentId: 'step', stepId: 'step', text: 'auxiliary', stream: 'stdout' });`,
         `    bus.emit({ type: 'pipelineEnd', runId: 'root-event-failure', timestamp: Date.now(), success: true, status: 'success' });`,
         `    return { runId: 'root-event-failure', success: true, status: 'success' };`,
         `  }`,
@@ -1347,6 +1723,62 @@ test('event journal failure cannot change successful execution or terminal state
     const completed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     assert.equal(completed.status, 'success');
     assert.equal(completed.result.runId, 'root-event-failure');
+});
+
+test('worker fails closed when canonical lifecycle persistence is unavailable', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const runId = 'run_lifecycle_persist_failure';
+    const pipelinePath = path.join(workspace, 'pipeline', 'demo.intent.json');
+    fs.writeFileSync(pipelinePath, JSON.stringify({
+        name: 'lifecycle-persist-failure',
+        steps: [{
+            id: 'required-lifecycle',
+            intent: 'system.setVar',
+            payload: { name: 'result', value: 'must-not-succeed' }
+        }]
+    }), 'utf8');
+    const canonicalPipelinePath = fs.realpathSync.native(pipelinePath);
+    const pipelineHash = createHash('sha256').update(fs.readFileSync(canonicalPipelinePath)).digest('hex');
+    const state: DetachedRunState = {
+        detachedRunId: runId,
+        correlationId: 'lifecycle-persist-failure',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: 'demo',
+        pipelinePath: canonicalPipelinePath,
+        pipelineHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    const statePath = stateFilePath(workspace, runId);
+    const eventPath = eventsFilePath(workspace, runId);
+    writeJsonFile(statePath, state);
+    // A directory at the journal path fails appendFileSync consistently on Windows
+    // without depending on ACL semantics or elevated process permissions.
+    fs.mkdirSync(eventPath, { recursive: true });
+
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const result = cp.spawnSync(process.execPath, [
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', runId,
+        '--pipeline', 'demo',
+        '--pipeline_path', canonicalPipelinePath,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stderr.includes(eventPath), false);
+    assert.equal(result.stderr.includes('EISDIR'), false);
+    const completed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(completed.status, 'failure');
+    assert.equal(completed.errorCode, 'RUN_LIFECYCLE_PERSIST_FAILED');
+    assert.equal(completed.error, 'Canonical step lifecycle event could not be persisted.');
+    assert.equal(completed.result, undefined);
+    assert.deepEqual(fs.readdirSync(eventPath), []);
 });
 
 test('worker publishes a sanitized error event before catch makes state terminal', (t) => {
@@ -1637,7 +2069,336 @@ test('event journal uses an allowlist and persists only hashes for log text', (t
     }), { runId: 'runtime-1', success: true, status: 'success' });
     const safeError = sanitizeWorkerError(Object.assign(new Error('exception-secret-value'), { code: 'UPSTREAM_FAILED' }));
     assert.deepEqual(safeError, { code: 'RUN_WORKER_FAILED', message: 'Detached worker failed.' });
+    assert.deepEqual(
+        sanitizeWorkerError(Object.assign(new Error('journal-secret-value'), { code: 'RUN_LIFECYCLE_PERSIST_FAILED' })),
+        {
+            code: 'RUN_LIFECYCLE_PERSIST_FAILED',
+            message: 'Canonical step lifecycle event could not be persisted.'
+        }
+    );
     assert.equal(JSON.stringify(safeError).includes('exception-secret-value'), false);
+});
+
+test('worker attributes lifecycle only from verified approved bundle facts', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_bundle';
+    const runtimeRunId = 'runtime_lifecycle_bundle';
+    const planId = 'plan_lifecycle';
+    const pipeline = {
+        name: 'lifecycle',
+        steps: [{
+            id: 'compile-step',
+            intent: 'system.setVar',
+            payload: { name: 'result', value: 'ok' },
+            meta: { sourceNodeId: 'source-node-7' }
+        }]
+    };
+    const serialized = JSON.stringify(pipeline);
+    const pipelineHash = createHash('sha256').update(serialized).digest('hex');
+    const bundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', planId);
+    fs.mkdirSync(bundleDirectory, { recursive: true });
+    const pipelinePath = path.join(bundleDirectory, `${pipelineHash}.intent.json`);
+    fs.writeFileSync(pipelinePath, serialized, 'utf8');
+    const state: DetachedRunState = {
+        detachedRunId,
+        correlationId: 'lifecycle-bundle',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: pipelinePath,
+        pipelinePath: fs.realpathSync.native(pipelinePath),
+        pipelineHash,
+        planId,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, detachedRunId), state);
+    const preloadPath = path.join(workspace, 'lifecycle-runtime.cjs');
+    const runtimeModule = path.resolve(__dirname, '..', 'coreRuntime.js');
+    const eventBusModule = path.resolve(__dirname, '..', 'eventBus.js');
+    fs.writeFileSync(preloadPath, [
+        `const bus = require(${JSON.stringify(eventBusModule)}).pipelineEventBus;`,
+        `require(${JSON.stringify(runtimeModule)}).CoreRuntime = class {`,
+        `  async run_pipeline_data() {`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_unopened', intentId: 'legacy-unopened', stepId: 'compile-step', timestamp: 990 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_unopened', intentId: 'legacy-unopened', stepId: 'compile-step', timestamp: 991, success: true });`,
+        `    bus.emit({ type: 'pipelineStart', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1000 });`,
+        `    bus.emit({ type: 'stepStart', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1100 });`,
+        `    bus.emit({ type: 'pipelineStart', runId: 'runtime_lifecycle_child', timestamp: 1110 });`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1120 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_child', intentId: 'intent-child', stepId: 'compile-step', index: 0, timestamp: 1130, success: true });`,
+        `    bus.emit({ type: 'pipelineEnd', runId: 'runtime_lifecycle_child', timestamp: 1140, success: true, status: 'success' });`,
+        `    bus.emit({ type: 'stepStart', runId: 'runtime_lifecycle_child', intentId: 'legacy-closed', stepId: 'compile-step', timestamp: 1150 });`,
+        `    bus.emit({ type: 'stepEnd', runId: 'runtime_lifecycle_child', intentId: 'legacy-closed', stepId: 'compile-step', timestamp: 1160, success: true });`,
+        `    bus.emit({ type: 'stepEnd', runId: ${JSON.stringify(runtimeRunId)}, intentId: 'intent-7', stepId: 'compile-step', index: 0, timestamp: 1200, success: true });`,
+        `    bus.emit({ type: 'pipelineEnd', runId: ${JSON.stringify(runtimeRunId)}, timestamp: 1300, success: true, status: 'success' });`,
+        `    return { runId: ${JSON.stringify(runtimeRunId)}, success: true, status: 'success' };`,
+        `  }`,
+        `  pause() {} resume() {} cancel() {}`,
+        `};`
+    ].join('\n'), 'utf8');
+    const workerPath = path.resolve(__dirname, '..', 'services', 'runSupervisorWorker.js');
+    const result = cp.spawnSync(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', state.workspaceRoot,
+        '--run_id', detachedRunId,
+        '--pipeline', pipelinePath,
+        '--pipeline_path', state.pipelinePath!,
+        '--pipeline_hash', pipelineHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+
+    const supervisor = new RunSupervisorService(workspace);
+    const page = supervisor.tail_events('lifecycle-bundle', undefined, RUN_LOG_MAX_LIMIT);
+    const lifecycle = page.events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(lifecycle.length, 4);
+    const rootLifecycle = lifecycle.filter((event) => event.runtime_run_id === runtimeRunId);
+    const childLifecycle = lifecycle.filter((event) => event.runtime_run_id === 'runtime_lifecycle_child');
+    assert.deepEqual(rootLifecycle.map((event) => event.state), ['running', 'succeeded']);
+    assert.deepEqual(childLifecycle.map((event) => event.state), ['running', 'succeeded']);
+    assert.equal(page.events.some((event) => event.type === 'stepStart' || event.type === 'stepEnd'), false);
+    assert.equal(new Set(rootLifecycle.map((event) => event.logical_execution_id)).size, 1);
+    assert.equal(new Set(childLifecycle.map((event) => event.logical_execution_id)).size, 1);
+    assert.notEqual(rootLifecycle[0].logical_execution_id, childLifecycle[0].logical_execution_id);
+    assert.equal(
+        rootLifecycle[0].logical_execution_id,
+        stableLogicalExecutionId(
+            detachedRunId,
+            runtimeRunId,
+            runtimeLogicalExecutionId(runtimeRunId, 'derived', 'intent-7', 'compile-step', 0)
+        )
+    );
+    for (const event of rootLifecycle) {
+        assert.equal(event.event_type, 'step_lifecycle');
+        assert.equal(event.event_version, 1);
+        assert.equal(event.runtime_run_id, runtimeRunId);
+        assert.equal(event.run_id, runtimeRunId);
+        assert.equal(event.detached_run_id, detachedRunId);
+        assert.equal(event.attempt, 1);
+        assert.equal(event.step_id, 'compile-step');
+        assert.equal(event.source_node_id, 'source-node-7');
+        assert.equal(event.pipeline_hash, pipelineHash);
+        assert.equal(event.pipeline_path, state.pipelinePath);
+        assert.equal(event.plan_id, planId);
+        assert.ok(event.origin_timestamp);
+        assert.ok(event.persisted_timestamp);
+        assert.equal(event.occurred_at, event.origin_timestamp);
+        assert.ok(Date.parse(event.persisted_timestamp!) >= Date.parse(event.origin_timestamp!));
+    }
+    assert.ok(childLifecycle.every((event) => event.source_node_id === null));
+    assert.ok(childLifecycle.every((event) => event.pipeline_hash === null));
+    assert.ok(childLifecycle.every((event) => event.pipeline_path === null));
+    assert.ok(childLifecycle.every((event) => event.plan_id === null));
+    assert.equal(rootLifecycle[0].origin_timestamp, new Date(1100).toISOString());
+    assert.equal(rootLifecycle[1].origin_timestamp, new Date(1200).toISOString());
+
+    const authorRunId = 'run_lifecycle_author';
+    const authorPath = path.join(workspace, 'pipeline', 'demo.intent.json');
+    fs.writeFileSync(authorPath, serialized, 'utf8');
+    const canonicalAuthorPath = fs.realpathSync.native(authorPath);
+    const authorHash = createHash('sha256').update(serialized).digest('hex');
+    const authorState: DetachedRunState = {
+        detachedRunId: authorRunId,
+        correlationId: 'lifecycle-author',
+        workspaceRoot: state.workspaceRoot,
+        pipeline: 'demo',
+        pipelinePath: canonicalAuthorPath,
+        pipelineHash: authorHash,
+        dryRun: true,
+        status: 'starting',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    writeJsonFile(stateFilePath(workspace, authorRunId), authorState);
+    const authorResult = cp.spawnSync(process.execPath, [
+        '--require', preloadPath,
+        workerPath,
+        '--workspace', authorState.workspaceRoot,
+        '--run_id', authorRunId,
+        '--pipeline', 'demo',
+        '--pipeline_path', canonicalAuthorPath,
+        '--pipeline_hash', authorHash,
+        '--dry_run'
+    ], { encoding: 'utf8' });
+    assert.equal(authorResult.status, 0, authorResult.stderr);
+    const authorLifecycle = supervisor.tail_events('lifecycle-author', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle' && event.runtime_run_id === runtimeRunId);
+    assert.equal(authorLifecycle.length, 2);
+    assert.ok(authorLifecycle.every((event) => event.step_id === 'compile-step'));
+    assert.ok(authorLifecycle.every((event) => event.source_node_id === null));
+    assert.ok(authorLifecycle.every((event) => event.plan_id === null));
+    assert.ok(authorLifecycle.every((event) => event.pipeline_hash === authorHash));
+    assert.ok(authorLifecycle.every((event) => event.pipeline_path === canonicalAuthorPath));
+    assert.notEqual(authorLifecycle[0].logical_execution_id, rootLifecycle[0].logical_execution_id);
+});
+
+test('tail_events validates raw lifecycle identity, timestamps, and verified root provenance', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_projection_guard';
+    const runtimeRunId = 'runtime_lifecycle_projection_guard';
+    const planId = 'plan_projection_guard';
+    const pipeline = {
+        name: 'projection-guard',
+        steps: [{
+            id: 'guard-step',
+            intent: 'system.setVar',
+            payload: { name: 'guard', value: 'ok' },
+            meta: { sourceNodeId: 'source-guard' }
+        }]
+    };
+    const serialized = JSON.stringify(pipeline);
+    const pipelineHash = createHash('sha256').update(serialized).digest('hex');
+    const bundleDirectory = path.join(workspace, '.leiok', 'execution-bundles', planId);
+    fs.mkdirSync(bundleDirectory, { recursive: true });
+    const pipelinePath = path.join(bundleDirectory, `${pipelineHash}.intent.json`);
+    fs.writeFileSync(pipelinePath, serialized, 'utf8');
+    const state: DetachedRunState = {
+        detachedRunId,
+        correlationId: 'projection-guard',
+        workspaceRoot: fs.realpathSync.native(workspace),
+        pipeline: pipelinePath,
+        pipelinePath: fs.realpathSync.native(pipelinePath),
+        pipelineHash,
+        planId,
+        pipelineRunId: runtimeRunId,
+        dryRun: true,
+        status: 'success',
+        startedAt: 1000,
+        updatedAt: 2000,
+        endedAt: 2000
+    };
+    writeJsonFile(stateFilePath(workspace, detachedRunId), state);
+    const eventPath = eventsFilePath(workspace, detachedRunId);
+    const basePayload = {
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId,
+        detachedRunId,
+        logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-logical'),
+        attempt: 1,
+        stepId: 'guard-step',
+        sourceNodeId: 'source-guard',
+        pipelineHash,
+        pipelinePath: state.pipelinePath,
+        planId,
+        state: 'succeeded',
+        originTimestamp: 1000,
+        persistedTimestamp: 2000
+    };
+    const divergences = [
+        {},
+        { runtimeRunId: 'runtime_spoofed' },
+        { detachedRunId: 'run_spoofed' },
+        { persistedTimestamp: 2001 },
+        { pipelineHash: 'f'.repeat(64) },
+        { sourceNodeId: 'source-spoofed' }
+    ];
+    divergences.forEach((patch, index) => appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000,
+        runId: runtimeRunId,
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, `guard-${index}`),
+            ...patch
+        }
+    }));
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000.5,
+        runId: runtimeRunId,
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-fractional-ts'),
+            persistedTimestamp: 2000.5
+        }
+    });
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: 2000,
+        runId: 'runtime invalid',
+        type: 'step_lifecycle',
+        payload: {
+            ...basePayload,
+            logicalExecutionId: stableLogicalExecutionId(detachedRunId, runtimeRunId, 'guard-invalid-record-run')
+        }
+    });
+
+    const lifecycle = new RunSupervisorService(workspace)
+        .tail_events('projection-guard', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(lifecycle.length, divergences.length + 2);
+    assert.equal(lifecycle[0].state, 'succeeded');
+    assert.equal(lifecycle[0].source_node_id, 'source-guard');
+    assert.equal(lifecycle[0].pipeline_hash, pipelineHash);
+    for (const event of lifecycle.slice(1)) {
+        assert.equal(event.state, 'unknown');
+        assert.equal(event.source_node_id, null);
+        assert.equal(event.pipeline_hash, null);
+        assert.equal(event.pipeline_path, null);
+        assert.equal(event.plan_id, null);
+    }
+
+    fs.writeFileSync(pipelinePath, '{"changed":true}', 'utf8');
+    const degraded = new RunSupervisorService(workspace)
+        .tail_events('projection-guard', undefined, RUN_LOG_MAX_LIMIT)
+        .events.filter((event) => event.type === 'step_lifecycle');
+    assert.equal(degraded.length, lifecycle.length);
+    assert.ok(degraded.every((event) => event.state === 'unknown'));
+    assert.ok(degraded.every((event) => event.source_node_id === null));
+    assert.ok(degraded.every((event) => event.pipeline_hash === null));
+});
+
+test('lifecycle cursor replay preserves identities, null attribution, and timestamps', (t) => {
+    const workspace = createWorkspace();
+    t.after(() => removeWorkspace(workspace));
+    const detachedRunId = 'run_lifecycle_cursor';
+    seedRunState(workspace, detachedRunId, 'lifecycle-cursor');
+    const eventPath = eventsFilePath(workspace, detachedRunId);
+    const payload = {
+        eventType: 'step_lifecycle',
+        eventVersion: 1,
+        runtimeRunId: 'runtime_cursor',
+        detachedRunId,
+        logicalExecutionId: 'step_cursor_execution',
+        attempt: 1,
+        stepId: null,
+        sourceNodeId: null,
+        pipelineHash: null,
+        pipelinePath: null,
+        planId: null,
+        state: 'unknown',
+        originTimestamp: 1_700_000_000_000,
+        persistedTimestamp: 1_700_000_000_100
+    };
+    appendEventRecord(eventPath, {
+        eventVersion: 1,
+        ts: payload.persistedTimestamp,
+        runId: payload.runtimeRunId,
+        type: 'step_lifecycle',
+        payload
+    });
+    const supervisor = new RunSupervisorService(workspace);
+    const first = supervisor.tail_events('lifecycle-cursor', undefined, 1);
+    const replay = supervisor.tail_events('lifecycle-cursor', undefined, 1);
+    assert.deepEqual(replay, first);
+    assert.equal(first.events.length, 1);
+    assert.equal(first.events[0].event_type, 'step_lifecycle');
+    assert.equal(first.events[0].state, 'unknown');
+    assert.equal(first.events[0].step_id, null);
+    assert.equal(first.events[0].source_node_id, null);
+    assert.equal(first.events[0].pipeline_hash, null);
+    assert.equal(first.events[0].pipeline_path, null);
+    assert.equal(first.events[0].plan_id, null);
+    assert.equal(first.events[0].origin_timestamp, new Date(payload.originTimestamp).toISOString());
+    assert.equal(first.events[0].persisted_timestamp, new Date(payload.persistedTimestamp).toISOString());
+    assert.deepEqual(supervisor.tail_events('lifecycle-cursor', first.next_cursor, 1).events, []);
 });
 
 test('run_logs returns stable opaque cursors and event identities across retries and legacy cursors', (t) => {

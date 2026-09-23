@@ -4,6 +4,11 @@ import { CoreRuntime } from '../coreRuntime';
 import { pipelineEventBus } from '../eventBus';
 import { readPipelineSource } from '../pipelineSource';
 import {
+    STEP_LIFECYCLE_EVENT_TYPE,
+    StepLifecycleEvent,
+    stableLogicalExecutionId
+} from '../stepLifecycleContract';
+import {
     appendEventRecord,
     cancelFilePath,
     ctrlFilePath,
@@ -186,6 +191,28 @@ async function main(): Promise<void> {
     } catch {
         failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_INVALID', 'Pipeline content is not valid JSON.');
     }
+    const approvedPlanId = pipelineSource.approvedBundleHash === actualHash
+        ? path.basename(path.dirname(pipelinePath))
+        : null;
+    if (state.planId && state.planId !== approvedPlanId) {
+        failBeforeRuntime(statePath, eventsPath, state, 'RUN_PIPELINE_CHANGED', 'Approved plan identity changed before execution.');
+    }
+    const sourceNodeByStepId = new Map<string, string>();
+    if (approvedPlanId && Array.isArray(pipelineData?.steps)) {
+        for (const step of pipelineData.steps) {
+            const stepId = String(step?.id || '').trim();
+            const sourceNodeId = String(step?.meta?.sourceNodeId || '').trim();
+            if (
+                stepId
+                && sourceNodeId
+                && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(stepId)
+                && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(sourceNodeId)
+                && !sourceNodeByStepId.has(stepId)
+            ) {
+                sourceNodeByStepId.set(stepId, sourceNodeId);
+            }
+        }
+    }
 
     const runtime = new CoreRuntime({
         workspaceRoot: args.workspaceRoot,
@@ -210,18 +237,32 @@ async function main(): Promise<void> {
     );
     writeJsonFile(statePath, state);
 
-    const appendEvent = (type: string, payload: any, runIdOverride?: string) => {
+    let lifecyclePersistenceError: (Error & { code: string }) | undefined;
+    const appendEvent = (
+        type: string,
+        payload: any,
+        runIdOverride?: string,
+        persistedAt = Date.now(),
+        required = false
+    ) => {
         const eventRunId = String(runIdOverride || state.pipelineRunId || args.runId || '').trim() || args.runId;
         try {
             appendEventRecord(eventsPath, {
                 eventVersion: 1,
-                ts: Date.now(),
+                ts: persistedAt,
                 runId: eventRunId,
                 type,
                 payload
             });
         } catch {
-            // Observability must not alter pipeline execution or terminal state.
+            if (required) {
+                lifecyclePersistenceError ||= Object.assign(
+                    new Error('Canonical step lifecycle event could not be persisted.'),
+                    { code: 'RUN_LIFECYCLE_PERSIST_FAILED' }
+                );
+                throw lifecyclePersistenceError;
+            }
+            // Auxiliary observability must not alter pipeline execution or terminal state.
         }
     };
 
@@ -258,7 +299,35 @@ async function main(): Promise<void> {
 
     const subscription = pipelineEventBus.on((event: any) => {
         const eventRunId = String(event?.runId || '').trim() || undefined;
-        appendEvent(String(event?.type || 'unknown'), event, eventRunId);
+        if (event?.type === STEP_LIFECYCLE_EVENT_TYPE) {
+            if (lifecyclePersistenceError) throw lifecyclePersistenceError;
+            const lifecycle = event as StepLifecycleEvent;
+            const persistedAt = Date.now();
+            const stepId = String(lifecycle.stepId || '').trim() || null;
+            const verifiedRootEvent = Boolean(rootRunId && eventRunId === rootRunId);
+            appendEvent(STEP_LIFECYCLE_EVENT_TYPE, {
+                eventType: STEP_LIFECYCLE_EVENT_TYPE,
+                eventVersion: 1,
+                runtimeRunId: eventRunId || args.runId,
+                detachedRunId: state.detachedRunId,
+                logicalExecutionId: stableLogicalExecutionId(
+                    state.detachedRunId,
+                    eventRunId || args.runId,
+                    lifecycle.logicalExecutionId
+                ),
+                attempt: lifecycle.attempt,
+                stepId,
+                sourceNodeId: verifiedRootEvent && stepId ? (sourceNodeByStepId.get(stepId) || null) : null,
+                pipelineHash: verifiedRootEvent ? actualHash : null,
+                pipelinePath: verifiedRootEvent ? pipelinePath : null,
+                planId: verifiedRootEvent ? approvedPlanId : null,
+                state: lifecycle.state,
+                originTimestamp: lifecycle.timestamp,
+                persistedTimestamp: persistedAt
+            }, eventRunId, persistedAt, true);
+        } else if (event?.type !== 'stepStart' && event?.type !== 'stepEnd') {
+            appendEvent(String(event?.type || 'unknown'), event, eventRunId);
+        }
 
         if (event?.type === 'pipelineStart') {
             if (rootRunId && eventRunId !== rootRunId) return;
@@ -466,6 +535,7 @@ async function main(): Promise<void> {
             dryRun: args.dryRun,
             from: args.from
         });
+        if (lifecyclePersistenceError) throw lifecyclePersistenceError;
         const nextStatus: RunStatus = result?.status === 'cancelled'
             ? 'cancelled'
             : (result?.success ? 'success' : 'failure');
@@ -487,7 +557,8 @@ async function main(): Promise<void> {
         });
         process.exitCode = finalStatus === 'success' ? 0 : 1;
     } catch (error: any) {
-        if (cancellationIsDurable()) {
+        const sanitizedError = sanitizeWorkerError(error);
+        if (sanitizedError.code !== 'RUN_LIFECYCLE_PERSIST_FAILED' && cancellationIsDurable()) {
             appendEvent('run.worker_finished', { status: 'cancelled', success: false }, state.pipelineRunId || args.runId);
             writeState({
                 status: 'cancelled',
@@ -505,7 +576,6 @@ async function main(): Promise<void> {
             process.exitCode = 1;
             return;
         }
-        const sanitizedError = sanitizeWorkerError(error);
         appendEvent('run.worker_error', { code: sanitizedError.code }, state.pipelineRunId || args.runId);
         writeState({
             status: 'failure',

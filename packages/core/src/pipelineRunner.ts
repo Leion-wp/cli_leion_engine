@@ -631,7 +631,7 @@ async function runPipeline(
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
     let currentCwd = resolveInitialCwd();
     const trustedRoot = workspaceRoot ?? path.resolve('.');
-    const runId = Date.now().toString(36);
+    const runId = `runtime_${Date.now().toString(36)}_${generateSecureToken(16)}`;
     currentRunId = runId;
     const subPipelineDepth = Number.isFinite(Number(context?.subPipelineDepth))
         ? Math.max(0, Math.floor(Number(context?.subPipelineDepth)))
@@ -668,7 +668,18 @@ async function runPipeline(
                 }
             };
             const stepId = String(step?.id || '').trim();
-            if (stepId && blockedStepIds.has(stepId)) { currentIndex++; continue; }
+            if (stepId && blockedStepIds.has(stepId)) {
+                pipelineEventBus.emitStepLifecycle({
+                    runId,
+                    stepId: step.id,
+                    index: currentIndex,
+                    attempt: 1,
+                    state: 'skipped',
+                    timestamp: Date.now()
+                });
+                currentIndex++;
+                continue;
+            }
             const localIntentId = generateSecureToken(8);
 
             // These runner-owned operations bypass routeIntent. In preview they
@@ -676,7 +687,7 @@ async function runPipeline(
             if (step.meta?.dryRun && ['system.form', 'memory.save', 'memory.recall', 'memory.clear'].includes(step.intent)) {
                 pipelineEventBus.emit({ type: 'stepStart', runId, intentId: localIntentId, timestamp: Date.now(), description: step.description, intent: step.intent, index: currentIndex, stepId: step.id });
                 pipelineEventBus.emit({ type: 'stepLog', runId, intentId: localIntentId, stepId: step.id, text: `[dry-run] Skipped ${step.intent}; no input or memory operation performed.`, stream: 'stdout' });
-                pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, index: currentIndex, stepId: step.id });
+                pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, lifecycleState: 'skipped', index: currentIndex, stepId: step.id });
                 currentIndex++;
                 continue;
             }
@@ -765,7 +776,7 @@ async function runPipeline(
                 }
                 if (isCancelled) {
                     runStatus = 'cancelled';
-                    pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false, index: currentIndex, stepId: step.id });
+                    pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false, lifecycleState: 'cancelled', index: currentIndex, stepId: step.id });
                     break;
                 }
                 pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: true, index: currentIndex, stepId: step.id });
@@ -863,6 +874,7 @@ async function runPipeline(
                         let failureCount = 0;
                         let truncated = false;
                         let lastErrorMessage = '';
+                        graphCycles:
                         for (let cycleIndex = 0; cycleIndex < repeatCount; cycleIndex += 1) {
                             for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
                                 if ((Date.now() - loopStartTs) > maxDurationCfg) {
@@ -878,62 +890,171 @@ async function runPipeline(
                                 variableCache.set('loop_cycle', String(cycleIndex));
 
                                 for (const graphStepId of graphStepIds) {
+                                    while (isPaused && !isCancelled) await sleep(100);
+                                    if (isCancelled) break graphCycles;
                                     const projectedOps = (processedItems * Math.max(1, graphStepIds.length)) + 1;
                                     if (projectedOps > maxTotalOpsCfg) {
                                         throw new Error(`Loop maxTotalOps exceeded (${maxTotalOpsCfg}).`);
                                     }
-                                    const targetStep = pipeline.steps.find((entry: any) => String(entry?.id || '').trim() === graphStepId);
+                                    const targetStepIndex = pipeline.steps.findIndex((entry: any) => String(entry?.id || '').trim() === graphStepId);
+                                    const targetStep = targetStepIndex === -1 ? undefined : pipeline.steps[targetStepIndex];
                                     if (!targetStep) {
                                         throw new Error(`Loop graph_segment target step not found: ${graphStepId}`);
                                     }
+                                    const targetIntentId = generateSecureToken(12);
+                                    const targetOrdinal = successCount + failureCount;
+                                    const targetLogicalExecutionId = `graph_segment:${localIntentId}:${cycleIndex}:${itemIndex}:${targetOrdinal}:${graphStepId}`;
+                                    pipelineEventBus.emit({
+                                        type: 'stepStart',
+                                        runId,
+                                        intentId: targetIntentId,
+                                        logicalExecutionId: targetLogicalExecutionId,
+                                        timestamp: Date.now(),
+                                        description: targetStep.description,
+                                        intent: targetStep.intent,
+                                        index: targetStepIndex,
+                                        stepId: targetStep.id
+                                    });
                                     pipelineEventBus.emit({
                                         type: 'stepLog',
                                         runId,
-                                        intentId: localIntentId,
-                                        stepId: step.id,
+                                        intentId: targetIntentId,
+                                        stepId: targetStep.id,
                                         text: `[loop] iter=${globalIndex + 1} cycle=${cycleIndex + 1} item="${String(items[itemIndex])}" step=${graphStepId}`,
                                         stream: 'stdout'
                                     } as any);
-                                    const compiledTarget = await compileStep(targetStep, variableCache, currentCwd, trustedRoot);
-                                    const sandboxPolicy = resolveRuntimeSandboxPolicy(compiledTarget);
-                                    const sandboxError = checkRuntimeSandbox(compiledTarget, sandboxPolicy, sandboxUsage);
-                                    if (sandboxError) {
-                                        throw new Error(`[sandbox] ${sandboxError}`);
-                                    }
-                                    if (detectIntentUsesNetwork(compiledTarget)) sandboxUsage.networkOps += 1;
-                                    if (detectIntentWritesFiles(compiledTarget)) sandboxUsage.fileWrites += 1;
+                                    lastErrorMessage = '';
+                                    let childResult: any = false;
+                                    let interactionError: any;
+                                    let finalTargetAttempt = 1;
+                                    try {
+                                        const compiledTarget = await compileStep(targetStep, variableCache, currentCwd, trustedRoot);
+                                        const sandboxPolicy = resolveRuntimeSandboxPolicy(compiledTarget);
+                                        const retryPolicy = resolveRetryPolicy(compiledTarget);
+                                        const sandboxError = checkRuntimeSandbox(compiledTarget, sandboxPolicy, sandboxUsage);
+                                        if (sandboxError) {
+                                            throw new Error(`[sandbox] ${sandboxError}`);
+                                        }
+                                        if (detectIntentUsesNetwork(compiledTarget)) sandboxUsage.networkOps += 1;
+                                        if (detectIntentWritesFiles(compiledTarget)) sandboxUsage.fileWrites += 1;
 
-                                    const childResult = await Promise.race([
-                                        routeIntent(
-                                            {
-                                                ...compiledTarget,
-                                                meta: {
-                                                    ...(compiledTarget.meta || {}),
-                                                    dryRun: step.meta?.dryRun === true || compiledTarget.meta?.dryRun === true,
-                                                    traceId: generateSecureToken(8),
+                                        for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt += 1) {
+                                            while (isPaused && !isCancelled) await sleep(100);
+                                            if (isCancelled) break;
+                                            finalTargetAttempt = attempt;
+                                            if (attempt > 1) {
+                                                pipelineEventBus.emitStepLifecycle({
                                                     runId,
-                                                    stepId: compiledTarget.id,
-                                                    cwd: currentCwd,
-                                                    subPipelineDepth: subPipelineDepth + 1
+                                                    intentId: targetIntentId,
+                                                    logicalExecutionId: targetLogicalExecutionId,
+                                                    stepId: targetStep.id,
+                                                    index: targetStepIndex,
+                                                    attempt,
+                                                    state: 'running',
+                                                    timestamp: Date.now()
+                                                });
+                                            }
+
+                                            let timeoutHandle: NodeJS.Timeout | undefined;
+                                            try {
+                                                childResult = await Promise.race([
+                                                    routeIntent(
+                                                        {
+                                                            ...compiledTarget,
+                                                            meta: {
+                                                                ...(compiledTarget.meta || {}),
+                                                                dryRun: step.meta?.dryRun === true || compiledTarget.meta?.dryRun === true,
+                                                                traceId: targetIntentId,
+                                                                runId,
+                                                                stepId: compiledTarget.id,
+                                                                cwd: currentCwd,
+                                                                subPipelineDepth: subPipelineDepth + 1
+                                                            }
+                                                        },
+                                                        variableCache
+                                                    ),
+                                                    new Promise<any>((_, reject) => {
+                                                        timeoutHandle = setTimeout(() => {
+                                                            reject(new Error(`Step timed out after ${sandboxPolicy.timeoutMs}ms.`));
+                                                        }, sandboxPolicy.timeoutMs);
+                                                    })
+                                                ]);
+                                            } catch (error: any) {
+                                                if (isInteractionRequired(error)) {
+                                                    interactionError = error;
+                                                    childResult = false;
+                                                    break;
                                                 }
-                                            },
-                                            variableCache
-                                        ),
-                                        new Promise<any>((_, reject) => {
-                                            const handle = setTimeout(() => {
-                                                clearTimeout(handle);
-                                                reject(new Error(`Step timed out after ${sandboxPolicy.timeoutMs}ms.`));
-                                            }, sandboxPolicy.timeoutMs);
-                                        })
-                                    ]).catch((error) => {
-                                        if (isInteractionRequired(error)) throw error;
+                                                if (isCancelled) {
+                                                    childResult = false;
+                                                    lastErrorMessage = '';
+                                                    break;
+                                                }
+                                                lastErrorMessage = String(error?.message || error || 'Unknown loop graph_segment error');
+                                                childResult = false;
+                                            } finally {
+                                                if (timeoutHandle) clearTimeout(timeoutHandle);
+                                            }
+
+                                            if (isCancelled) {
+                                                childResult = false;
+                                                lastErrorMessage = '';
+                                                break;
+                                            }
+                                            const attemptOk = typeof childResult === 'boolean'
+                                                ? childResult
+                                                : (childResult !== undefined && childResult !== null);
+                                            if (attemptOk || interactionError) break;
+                                            if (!lastErrorMessage) {
+                                                lastErrorMessage = `Step returned unsuccessful result for intent "${String(compiledTarget.intent || '')}".`;
+                                            }
+                                            if (attempt < retryPolicy.maxAttempts) {
+                                                const delayMs = computeRetryDelayMs(retryPolicy, attempt);
+                                                pipelineEventBus.emitStepLifecycle({
+                                                    runId,
+                                                    intentId: targetIntentId,
+                                                    logicalExecutionId: targetLogicalExecutionId,
+                                                    stepId: targetStep.id,
+                                                    index: targetStepIndex,
+                                                    attempt,
+                                                    state: 'retrying',
+                                                    timestamp: Date.now()
+                                                });
+                                                pipelineEventBus.emit({
+                                                    type: 'stepLog',
+                                                    runId,
+                                                    intentId: targetIntentId,
+                                                    stepId: targetStep.id,
+                                                    text: `[retry] attempt ${attempt}/${retryPolicy.maxAttempts} failed${lastErrorMessage ? `: ${lastErrorMessage}` : ''}${delayMs > 0 ? `; retry in ${delayMs}ms` : '; retry now'}`,
+                                                    stream: 'stderr'
+                                                } as any);
+                                                if (delayMs > 0) await sleep(delayMs);
+                                                if (isCancelled) break;
+                                            }
+                                        }
+                                    } catch (error: any) {
+                                        interactionError = isInteractionRequired(error) ? error : undefined;
                                         lastErrorMessage = String(error?.message || error || 'Unknown loop graph_segment error');
-                                        return false;
-                                    });
+                                        childResult = false;
+                                    }
 
                                     const ok = typeof childResult === 'boolean'
                                         ? childResult
                                         : (childResult !== undefined && childResult !== null);
+                                    pipelineEventBus.emit({
+                                        type: 'stepEnd',
+                                        runId,
+                                        intentId: targetIntentId,
+                                        logicalExecutionId: targetLogicalExecutionId,
+                                        timestamp: Date.now(),
+                                        success: ok,
+                                        lifecycleState: isCancelled ? 'cancelled' : (ok ? 'succeeded' : 'failed'),
+                                        attempt: finalTargetAttempt,
+                                        index: targetStepIndex,
+                                        stepId: targetStep.id
+                                    });
+                                    if (interactionError) throw interactionError;
+                                    if (isCancelled) break graphCycles;
                                     if (ok) {
                                         successCount += 1;
                                         continue;
@@ -947,6 +1068,14 @@ async function runPipeline(
                                 processedItems += 1;
                             }
                             if (truncated) break;
+                        }
+                        if (isCancelled) {
+                            pipelineEventBus.emit({
+                                type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false,
+                                lifecycleState: 'cancelled', index: currentIndex, stepId: step.id
+                            });
+                            runStatus = 'cancelled';
+                            break;
                         }
                         if (errorStrategy === 'fail_at_end' && failureCount > 0) {
                             throw new Error(`Loop completed with ${failureCount} failure(s) under fail_at_end strategy.`);
@@ -1007,7 +1136,10 @@ async function runPipeline(
                             text: `[loop] ${message}`,
                             stream: 'stderr'
                         } as any);
-                        pipelineEventBus.emit({ type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false, index: currentIndex, stepId: step.id });
+                        pipelineEventBus.emit({
+                            type: 'stepEnd', runId, intentId: localIntentId, timestamp: Date.now(), success: false,
+                            lifecycleState: isCancelled ? 'cancelled' : 'failed', index: currentIndex, stepId: step.id
+                        });
                         if (step.onFailure) {
                             const nextIdx = pipeline.steps.findIndex(s => s.id === step.onFailure);
                             if (nextIdx !== -1) {
@@ -1298,9 +1430,42 @@ async function runPipeline(
             }
 
             // COMPILE AND EXECUTE
-            const compiledStep = await compileStep(step, variableCache, currentCwd, trustedRoot);
-            const intentId = compiledStep.meta?.traceId ?? generateSecureToken(8);
-            pipelineEventBus.emit({ type: 'stepStart', runId, intentId, timestamp: Date.now(), description: compiledStep.description, intent: compiledStep.intent, index: currentIndex, stepId: compiledStep.id });
+            const intentId = step.meta?.traceId ?? generateSecureToken(8);
+            pipelineEventBus.emit({ type: 'stepStart', runId, intentId, timestamp: Date.now(), description: step.description, intent: step.intent, index: currentIndex, stepId: step.id });
+            let compiledStep: Intent;
+            try {
+                compiledStep = await compileStep(step, variableCache, currentCwd, trustedRoot);
+            } catch (error: any) {
+                const message = String(error?.message || error || 'Step compilation failed.');
+                pipelineEventBus.emit({
+                    type: 'stepLog',
+                    runId,
+                    intentId,
+                    stepId: step.id,
+                    text: `[compile] ${message}`,
+                    stream: 'stderr'
+                } as any);
+                pipelineEventBus.emit({
+                    type: 'stepEnd',
+                    runId,
+                    intentId,
+                    timestamp: Date.now(),
+                    success: false,
+                    lifecycleState: 'failed',
+                    attempt: 1,
+                    index: currentIndex,
+                    stepId: step.id
+                });
+                if (step.onFailure) {
+                    const nextIdx = pipeline.steps.findIndex(s => s.id === step.onFailure);
+                    if (nextIdx !== -1) {
+                        currentIndex = nextIdx;
+                        continue;
+                    }
+                }
+                runStatus = 'failure';
+                break;
+            }
 
             compiledStep.meta = {
                 ...(compiledStep.meta || {}),
@@ -1359,7 +1524,19 @@ async function runPipeline(
             let lastErrorMessage = '';
             let finalAttempt = 1;
             for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
+                if (isCancelled) break;
                 finalAttempt = attempt;
+                if (attempt > 1) {
+                    pipelineEventBus.emitStepLifecycle({
+                        runId,
+                        intentId,
+                        stepId: compiledStep.id,
+                        index: currentIndex,
+                        attempt,
+                        state: 'running',
+                        timestamp: Date.now()
+                    });
+                }
                 let timeoutHandle: NodeJS.Timeout | undefined;
                 try {
                     const timedResult = await Promise.race([
@@ -1402,8 +1579,24 @@ async function runPipeline(
                     if (timeoutHandle) clearTimeout(timeoutHandle);
                 }
 
+                if (isCancelled) {
+                    result = false;
+                    ok = false;
+                    lastErrorMessage = '';
+                    break;
+                }
+
                 if (attempt < retryPolicy.maxAttempts) {
                     const delayMs = computeRetryDelayMs(retryPolicy, attempt);
+                    pipelineEventBus.emitStepLifecycle({
+                        runId,
+                        intentId,
+                        stepId: compiledStep.id,
+                        index: currentIndex,
+                        attempt,
+                        state: 'retrying',
+                        timestamp: Date.now()
+                    });
                     pipelineEventBus.emit({
                         type: 'stepLog',
                         runId,
@@ -1413,6 +1606,7 @@ async function runPipeline(
                         stream: 'stderr'
                     } as any);
                     if (delayMs > 0) await sleep(delayMs);
+                    if (isCancelled) break;
                 }
             }
 
@@ -1442,7 +1636,17 @@ async function runPipeline(
                 variableCache.set(errorPolicy.captureErrorVar, JSON.stringify(capturedError));
             }
 
-            pipelineEventBus.emit({ type: 'stepEnd', runId, intentId, timestamp: Date.now(), success: ok, index: currentIndex, stepId: compiledStep.id });
+            pipelineEventBus.emit({
+                type: 'stepEnd',
+                runId,
+                intentId,
+                timestamp: Date.now(),
+                success: ok,
+                lifecycleState: isCancelled ? 'cancelled' : (ok ? 'succeeded' : 'failed'),
+                attempt: finalAttempt,
+                index: currentIndex,
+                stepId: compiledStep.id
+            });
 
             if (isCancelled) {
                 runStatus = 'cancelled';

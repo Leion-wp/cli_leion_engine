@@ -12,6 +12,14 @@ import {
     RUN_LOG_MAX_RESPONSE_BYTES,
     RUN_LOG_MAX_SCAN_BYTES
 } from '../runLogContract';
+import {
+    DurableStepLifecyclePayload,
+    STEP_LIFECYCLE_EVENT_TYPE,
+    STEP_LIFECYCLE_EVENT_VERSION,
+    StepLifecycleState,
+    isStepLifecycleState,
+    stableLogicalExecutionId
+} from '../stepLifecycleContract';
 
 export type RunStatus =
     | 'starting'
@@ -31,6 +39,7 @@ export type DetachedRunState = {
     pipeline: string;
     pipelinePath?: string;
     pipelineHash?: string;
+    planId?: string;
     from?: string;
     dryRun: boolean;
     status: RunStatus;
@@ -68,8 +77,18 @@ export type RunLogEvent = RunEventRecord & {
     run_id: string;
     detached_run_id: string;
     correlation_id?: string;
-    step_id?: string;
-    source_node_id?: string;
+    event_type?: string;
+    runtime_run_id?: string;
+    logical_execution_id?: string;
+    attempt?: number;
+    state?: StepLifecycleState;
+    step_id?: string | null;
+    source_node_id?: string | null;
+    pipeline_hash?: string | null;
+    pipeline_path?: string | null;
+    plan_id?: string | null;
+    origin_timestamp?: string | null;
+    persisted_timestamp?: string | null;
 };
 
 export type RunLogPage = {
@@ -363,6 +382,66 @@ const EVENT_PAYLOAD_FIELDS = [
     'dryRun', 'code'
 ] as const;
 
+const LIFECYCLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const LIFECYCLE_PLAN_PATTERN = /^(?!^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$))[A-Za-z0-9](?:[A-Za-z0-9._@+-]{0,254}[A-Za-z0-9_@+-])?$/i;
+const LIFECYCLE_TIMESTAMP_MAX = 8_640_000_000_000_000;
+
+function lifecycleId(value: any): string | null {
+    const normalized = String(value || '').trim();
+    return LIFECYCLE_ID_PATTERN.test(normalized) ? normalized : null;
+}
+
+function lifecycleTimestamp(value: any): number | null {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= LIFECYCLE_TIMESTAMP_MAX
+        ? Math.floor(parsed)
+        : null;
+}
+
+export function projectStepLifecyclePayload(value: any): DurableStepLifecyclePayload {
+    const attempt = Number(value?.attempt);
+    const originTimestamp = lifecycleTimestamp(value?.originTimestamp);
+    const persistedTimestamp = lifecycleTimestamp(value?.persistedTimestamp);
+    const pipelineHash = typeof value?.pipelineHash === 'string' && /^[a-f0-9]{64}$/.test(value.pipelineHash)
+        ? value.pipelineHash
+        : null;
+    const pipelinePath = typeof value?.pipelinePath === 'string'
+        && Buffer.byteLength(value.pipelinePath, 'utf8') <= 4096
+        && path.isAbsolute(value.pipelinePath)
+        ? path.normalize(value.pipelinePath)
+        : null;
+    const planId = typeof value?.planId === 'string' && LIFECYCLE_PLAN_PATTERN.test(value.planId)
+        ? value.planId
+        : null;
+    const structurallyComplete = value?.eventType === STEP_LIFECYCLE_EVENT_TYPE
+        && value?.eventVersion === STEP_LIFECYCLE_EVENT_VERSION
+        && lifecycleId(value?.runtimeRunId) !== null
+        && lifecycleId(value?.detachedRunId) !== null
+        && lifecycleId(value?.logicalExecutionId) !== null
+        && Number.isSafeInteger(attempt)
+        && attempt > 0
+        && isStepLifecycleState(value?.state)
+        && originTimestamp !== null
+        && persistedTimestamp !== null
+        && persistedTimestamp >= originTimestamp;
+    return {
+        eventType: STEP_LIFECYCLE_EVENT_TYPE,
+        eventVersion: STEP_LIFECYCLE_EVENT_VERSION,
+        runtimeRunId: lifecycleId(value?.runtimeRunId) || 'unknown',
+        detachedRunId: lifecycleId(value?.detachedRunId) || 'unknown',
+        logicalExecutionId: lifecycleId(value?.logicalExecutionId) || 'unknown',
+        attempt: Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 1,
+        stepId: lifecycleId(value?.stepId),
+        sourceNodeId: lifecycleId(value?.sourceNodeId),
+        pipelineHash,
+        pipelinePath,
+        planId,
+        state: structurallyComplete ? value.state : 'unknown',
+        originTimestamp,
+        persistedTimestamp: persistedTimestamp ?? 0
+    };
+}
+
 const JULES_ERROR_CODES = new Set([
     'JULES_NOT_CONFIGURED', 'JULES_REQUEST_INVALID', 'JULES_PLAN_APPROVAL_REQUIRED',
     'JULES_AUTH_FAILED', 'JULES_NOT_FOUND', 'JULES_RATE_LIMITED',
@@ -372,6 +451,7 @@ const JULES_ERROR_CODES = new Set([
 
 export function projectRunEventPayload(eventType: string, value: any): Record<string, any> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    if (eventType === STEP_LIFECYCLE_EVENT_TYPE) return projectStepLifecyclePayload(value);
     const projected: Record<string, any> = {};
     for (const key of EVENT_PAYLOAD_FIELDS) {
         const entry = value[key];
@@ -444,7 +524,12 @@ export function projectRunResult(value: any): { runId?: string; success: boolean
 
 export function sanitizeWorkerError(error: any): { code: string; message: string } {
     const rawCode = String(error?.code || '').trim();
-    const code = ['INTERACTION_REQUIRED', 'RUN_PIPELINE_CHANGED', 'RUN_PIPELINE_INVALID'].includes(rawCode)
+    const code = [
+        'INTERACTION_REQUIRED',
+        'RUN_PIPELINE_CHANGED',
+        'RUN_PIPELINE_INVALID',
+        'RUN_LIFECYCLE_PERSIST_FAILED'
+    ].includes(rawCode)
         ? rawCode
         : 'RUN_WORKER_FAILED';
     const message = code === 'INTERACTION_REQUIRED'
@@ -453,7 +538,9 @@ export function sanitizeWorkerError(error: any): { code: string; message: string
             ? 'Pipeline content changed before execution.'
             : code === 'RUN_PIPELINE_INVALID'
                 ? 'Pipeline content is not valid JSON.'
-                : 'Detached worker failed.';
+                : code === 'RUN_LIFECYCLE_PERSIST_FAILED'
+                    ? 'Canonical step lifecycle event could not be persisted.'
+                    : 'Detached worker failed.';
     return { code, message };
 }
 
@@ -539,6 +626,7 @@ function locateLegacyCursorOffset(
 }
 
 function safeLogPayload(eventType: string, value: any): Record<string, any> {
+    if (eventType === STEP_LIFECYCLE_EVENT_TYPE) return projectStepLifecyclePayload(value);
     const projected = projectRunEventPayload(eventType, value);
     const safe: Record<string, any> = {};
     const idFields = new Set(['runId', 'intentId', 'nodeId', 'stepId', 'detachedRunId', 'correlationId']);
@@ -604,9 +692,69 @@ function stableRunLogEventId(detachedRunId: string, byteOffset: number): string 
     return `evt_${createHash('sha256').update(`${detachedRunId}\0${byteOffset}`, 'utf8').digest('hex')}`;
 }
 
+type LifecycleProjectionContext = {
+    rootRunId: string | null;
+    rootVerified: boolean;
+    pipelineHash: string | null;
+    pipelinePath: string | null;
+    planId: string | null;
+    sourceNodeByStepId: Map<string, string>;
+};
+
+function buildLifecycleProjectionContext(
+    workspaceRoot: string,
+    state: DetachedRunState
+): LifecycleProjectionContext {
+    const unavailable: LifecycleProjectionContext = {
+        rootRunId: lifecycleId(state.pipelineRunId),
+        rootVerified: false,
+        pipelineHash: null,
+        pipelinePath: null,
+        planId: null,
+        sourceNodeByStepId: new Map<string, string>()
+    };
+    if (!unavailable.rootRunId || !state.pipelinePath || !state.pipelineHash) return unavailable;
+    try {
+        const source = readPipelineSource(workspaceRoot, state.pipelinePath);
+        const expectedPlanId = source.approvedBundleHash === source.contentHash
+            ? path.basename(path.dirname(source.path))
+            : null;
+        if (
+            source.path !== state.pipelinePath
+            || source.contentHash !== state.pipelineHash
+            || (state.planId || null) !== expectedPlanId
+        ) {
+            return unavailable;
+        }
+        const pipeline = JSON.parse(source.bytes.toString('utf8'));
+        if (!Array.isArray(pipeline?.steps)) return unavailable;
+        const sourceNodeByStepId = new Map<string, string>();
+        if (expectedPlanId) {
+            for (const step of pipeline.steps) {
+                const stepId = lifecycleId(step?.id);
+                const sourceNodeId = lifecycleId(step?.meta?.sourceNodeId);
+                if (stepId && sourceNodeId && !sourceNodeByStepId.has(stepId)) {
+                    sourceNodeByStepId.set(stepId, sourceNodeId);
+                }
+            }
+        }
+        return {
+            rootRunId: unavailable.rootRunId,
+            rootVerified: true,
+            pipelineHash: source.contentHash,
+            pipelinePath: source.path,
+            planId: expectedPlanId,
+            sourceNodeByStepId
+        };
+    } catch {
+        return unavailable;
+    }
+}
+
 function projectPersistedRunLogEvent(
     detachedRunId: string,
     correlationId: string | undefined,
+    lifecycleContext: LifecycleProjectionContext,
     sequence: number,
     byteOffset: number,
     line: Buffer
@@ -651,9 +799,77 @@ function projectPersistedRunLogEvent(
     const timestamp = Number(parsed.ts);
     const validTimestamp = Number.isFinite(timestamp) && timestamp >= 0 && timestamp <= 8_640_000_000_000_000;
     const safeTimestamp = validTimestamp ? Math.floor(timestamp) : 0;
-    const payload = safeLogPayload(rawType, parsed.payload);
+    const rawPayload = parsed.payload;
+    let payload = safeLogPayload(rawType, rawPayload);
     const persistedRunId = String(parsed.runId || '').trim();
     const safeRunId = LOG_ID_PATTERN.test(persistedRunId) ? persistedRunId : detachedRunId;
+    if (rawType === STEP_LIFECYCLE_EVENT_TYPE) {
+        const lifecyclePayload = payload as DurableStepLifecyclePayload;
+        const isRoot = Boolean(lifecycleContext.rootRunId && safeRunId === lifecycleContext.rootRunId);
+        const expectedPipelineHash = isRoot && lifecycleContext.rootVerified ? lifecycleContext.pipelineHash : null;
+        const expectedPipelinePath = isRoot && lifecycleContext.rootVerified ? lifecycleContext.pipelinePath : null;
+        const expectedPlanId = isRoot && lifecycleContext.rootVerified ? lifecycleContext.planId : null;
+        const rawStepId = lifecycleId(rawPayload?.stepId);
+        const expectedSourceNodeId = isRoot && lifecycleContext.rootVerified && rawStepId
+            ? (lifecycleContext.sourceNodeByStepId.get(rawStepId) || null)
+            : null;
+        const rawMatchesRecord = Boolean(
+            rawPayload
+            && typeof rawPayload === 'object'
+            && !Array.isArray(rawPayload)
+            && validTimestamp
+            && Number.isSafeInteger(timestamp)
+            && LOG_ID_PATTERN.test(persistedRunId)
+            && rawPayload.eventType === STEP_LIFECYCLE_EVENT_TYPE
+            && rawPayload.eventVersion === STEP_LIFECYCLE_EVENT_VERSION
+            && rawPayload.runtimeRunId === persistedRunId
+            && rawPayload.detachedRunId === detachedRunId
+            && typeof rawPayload.logicalExecutionId === 'string'
+            && lifecycleId(rawPayload.logicalExecutionId) === rawPayload.logicalExecutionId
+            && Number.isSafeInteger(rawPayload.attempt)
+            && rawPayload.attempt > 0
+            && (rawPayload.stepId === null || (
+                typeof rawPayload.stepId === 'string'
+                && lifecycleId(rawPayload.stepId) === rawPayload.stepId
+            ))
+            && isStepLifecycleState(rawPayload.state)
+            && typeof rawPayload.originTimestamp === 'number'
+            && Number.isSafeInteger(rawPayload.originTimestamp)
+            && lifecycleTimestamp(rawPayload.originTimestamp) !== null
+            && Number(rawPayload.originTimestamp) <= safeTimestamp
+            && rawPayload.persistedTimestamp === safeTimestamp
+        );
+        const provenanceMatches = isRoot
+            ? lifecycleContext.rootVerified
+                && rawPayload?.pipelineHash === expectedPipelineHash
+                && rawPayload?.pipelinePath === expectedPipelinePath
+                && rawPayload?.planId === expectedPlanId
+                && rawPayload?.sourceNodeId === expectedSourceNodeId
+            : rawPayload?.pipelineHash === null
+                && rawPayload?.pipelinePath === null
+                && rawPayload?.planId === null
+                && rawPayload?.sourceNodeId === null;
+        const trustedLifecycle = rawMatchesRecord && provenanceMatches;
+        payload = {
+            ...lifecyclePayload,
+            runtimeRunId: safeRunId,
+            detachedRunId,
+            logicalExecutionId: lifecyclePayload.logicalExecutionId === 'unknown'
+                ? stableLogicalExecutionId(detachedRunId, safeRunId, 'unknown', byteOffset)
+                : lifecyclePayload.logicalExecutionId,
+            state: trustedLifecycle ? lifecyclePayload.state : 'unknown',
+            sourceNodeId: trustedLifecycle ? expectedSourceNodeId : null,
+            pipelineHash: trustedLifecycle ? expectedPipelineHash : null,
+            pipelinePath: trustedLifecycle ? expectedPipelinePath : null,
+            planId: trustedLifecycle ? expectedPlanId : null,
+            persistedTimestamp: safeTimestamp
+        };
+    }
+    const lifecycle = rawType === STEP_LIFECYCLE_EVENT_TYPE
+        ? payload as DurableStepLifecyclePayload
+        : undefined;
+    const originTimestamp = lifecycle ? lifecycleTimestamp(lifecycle.originTimestamp) : safeTimestamp;
+    const persistedTimestamp = validTimestamp ? new Date(safeTimestamp).toISOString() : null;
     return {
         eventVersion: RUN_LOG_EVENT_VERSION,
         ts: safeTimestamp,
@@ -661,14 +877,29 @@ function projectPersistedRunLogEvent(
         type: rawType,
         payload,
         event_id: eventId,
-        occurred_at: validTimestamp ? new Date(safeTimestamp).toISOString() : null,
+        occurred_at: originTimestamp === null ? null : new Date(originTimestamp).toISOString(),
         event_version: RUN_LOG_EVENT_VERSION,
         sequence,
         run_id: safeRunId,
         detached_run_id: detachedRunId,
         ...(correlationId ? { correlation_id: correlationId } : {}),
-        ...(typeof payload.stepId === 'string' ? { step_id: payload.stepId } : {}),
-        ...(typeof payload.nodeId === 'string' ? { source_node_id: payload.nodeId } : {})
+        ...(lifecycle ? {
+            event_type: STEP_LIFECYCLE_EVENT_TYPE,
+            runtime_run_id: lifecycle.runtimeRunId,
+            logical_execution_id: lifecycle.logicalExecutionId,
+            attempt: lifecycle.attempt,
+            state: lifecycle.state,
+            step_id: lifecycle.stepId,
+            source_node_id: lifecycle.sourceNodeId,
+            pipeline_hash: lifecycle.pipelineHash,
+            pipeline_path: lifecycle.pipelinePath,
+            plan_id: lifecycle.planId,
+            origin_timestamp: originTimestamp === null ? null : new Date(originTimestamp).toISOString(),
+            persisted_timestamp: persistedTimestamp
+        } : {
+            ...(typeof payload.stepId === 'string' ? { step_id: payload.stepId } : {}),
+            ...(typeof payload.nodeId === 'string' ? { source_node_id: payload.nodeId } : {})
+        })
     };
 }
 
@@ -1051,6 +1282,9 @@ export class RunSupervisorService {
         }
         const pipelinePath = source.path;
         const pipelineHash = source.contentHash;
+        const planId = source.approvedBundleHash === pipelineHash
+            ? path.basename(path.dirname(pipelinePath))
+            : undefined;
         const from = String(options.from || '').trim() || undefined;
         const dryRun = options.dryRun === true;
         const fingerprint = requestFingerprint({
@@ -1086,6 +1320,7 @@ export class RunSupervisorService {
                 pipeline,
                 pipelinePath,
                 pipelineHash,
+                ...(planId ? { planId } : {}),
                 from,
                 dryRun,
                 status: 'starting',
@@ -1224,6 +1459,7 @@ export class RunSupervisorService {
         const state = this.findRunState(runId);
         if (!state) throw new RunSupervisorError('RUN_NOT_FOUND', `Run not found for id: ${runId}`);
         const pageLimit = normalizeRunLogLimit(limit);
+        const lifecycleContext = buildLifecycleProjectionContext(this.workspaceRoot, state);
         const cursorPosition = parseRunLogCursor(state.detachedRunId, cursor);
         const filePath = eventsFilePath(this.workspaceRoot, state.detachedRunId);
         const requestedRunId = String(runId || '').trim();
@@ -1299,6 +1535,7 @@ export class RunSupervisorService {
                 const event = projectPersistedRunLogEvent(
                     state.detachedRunId,
                     state.correlationId,
+                    lifecycleContext,
                     nextSequence,
                     startOffset + lineStart,
                     snapshot.subarray(lineStart, index)

@@ -6,6 +6,7 @@ export * from './ports/vscodeShim';
 export * from './runtimeCatalog';
 export * from './runLogContract';
 export * from './runControlContract';
+export * from './stepLifecycleContract';
 export * from './pipelineSource';
 export * from './validatePipeline';
 export * from './services/runSupervisorService';
